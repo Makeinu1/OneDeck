@@ -1,0 +1,114 @@
+name: OneDeck Pages preflight
+
+on:
+  push:
+    branches: [deploy/onedeck-play]
+    paths:
+      - '.github/workflows/onedeck-pages-preflight.yml'
+
+permissions: {}
+
+concurrency:
+  group: onedeck-pages-preflight
+  cancel-in-progress: false
+
+jobs:
+  preflight:
+    if: >-
+      ${{ github.repository == 'Makeinu1/OneDeck' &&
+          github.event_name == 'push' &&
+          github.ref == 'refs/heads/deploy/onedeck-play' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 3
+    steps:
+      - name: Verify existing Pages project without changing it
+        shell: python
+        env:
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+        run: |
+          import json
+          import os
+          import re
+          import sys
+          import urllib.error
+          import urllib.request
+          
+          
+          def stop(message):
+              print('::error::' + message)
+              raise SystemExit(1)
+          
+          
+          account = os.environ.get('CLOUDFLARE_ACCOUNT_ID', '').strip()
+          token = os.environ.get('CLOUDFLARE_API_TOKEN', '').strip()
+          if not account or not token:
+              stop('Both Cloudflare repository secrets must be configured.')
+          if not re.fullmatch(r'[a-fA-F0-9]{32}', account):
+              stop('Cloudflare account ID is not a 32-character hexadecimal ID.')
+          if re.search(r'\s', token):
+              stop('Cloudflare API token contains whitespace; store only the token value.')
+          
+          
+          class NoRedirect(urllib.request.HTTPRedirectHandler):
+              def redirect_request(self, req, fp, code, msg, headers, newurl):
+                  return None
+          
+          
+          # Fixed host and project. Credentials never enter output, files, or artifacts.
+          url = f'https://api.cloudflare.com/client/v4/accounts/{account}/pages/projects/onedeck-play'
+          request = urllib.request.Request(url, headers={
+              'Authorization': 'Bearer ' + token,
+              'Accept': 'application/json',
+          }, method='GET')
+          try:
+              with urllib.request.build_opener(NoRedirect).open(request, timeout=30) as response:
+                  raw = response.read(1024 * 1024 + 1)
+          except urllib.error.HTTPError as exc:
+              stop(f'Cloudflare project lookup returned HTTP {exc.code}; verify account and Pages permissions. Response body withheld.')
+          except (urllib.error.URLError, TimeoutError, OSError):
+              stop('Cloudflare project lookup could not complete; no Cloudflare changes were made.')
+          if len(raw) > 1024 * 1024:
+              stop('Cloudflare response exceeded the bounded metadata size.')
+          try:
+              data = json.loads(raw)
+          except (ValueError, UnicodeError):
+              stop('Cloudflare did not return valid project JSON.')
+          if not isinstance(data, dict) or data.get('success') is not True:
+              stop('Cloudflare did not confirm a successful project lookup.')
+          project = data.get('result')
+          if not isinstance(project, dict) or project.get('name') != 'onedeck-play':
+              stop('Cloudflare response did not identify the intended Pages project.')
+          if project.get('subdomain') != 'onedeck-play.pages.dev':
+              stop('The intended Pages project has an unexpected subdomain.')
+          
+          # Allowlisted public metadata only; never print the full response or env_vars.
+          branch = project.get('production_branch')
+          branch_label = branch if isinstance(branch, str) and re.fullmatch(r'[A-Za-z0-9._/-]{1,100}', branch) else '(not reported)'
+          deployment = project.get('canonical_deployment') or {}
+          if not isinstance(deployment, dict):
+              deployment = {}
+          deployment_url = deployment.get('url', '')
+          if not isinstance(deployment_url, str) or not re.fullmatch(r'https://[a-zA-Z0-9-]+\.onedeck-play\.pages\.dev/?', deployment_url):
+              deployment_url = '(not reported)'
+          metadata = deployment.get('deployment_trigger', {})
+          metadata = metadata.get('metadata', {}) if isinstance(metadata, dict) else {}
+          commit = metadata.get('commit_hash', '') if isinstance(metadata, dict) else ''
+          if not isinstance(commit, str) or not re.fullmatch(r'[a-fA-F0-9]{7,64}', commit):
+              commit = '(not reported)'
+          lines = [
+              '# OneDeck Pages preflight',
+              '',
+              '- Result: PASS (authenticated read only; no deployment performed)',
+              '- Project: onedeck-play',
+              '- Domain: onedeck-play.pages.dev',
+              f'- Production branch: {branch_label}',
+              f'- Current production deployment: {deployment_url}',
+              f'- Current production commit metadata: {commit}',
+              '- Pages upload capability is not yet exercised.',
+              '- No R2, Workers, DNS, project creation, or production writes were attempted.',
+          ]
+          summary = '\n'.join(lines) + '\n'
+          with open(os.environ['GITHUB_STEP_SUMMARY'], 'a', encoding='utf-8') as output:
+              output.write(summary)
+          print(summary)
