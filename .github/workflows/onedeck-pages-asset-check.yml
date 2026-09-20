@@ -5,7 +5,8 @@ on:
     branches: [deploy/onedeck-play]
     paths: ['.github/workflows/onedeck-pages-asset-check.yml']
 
-permissions: {}
+permissions:
+  contents: read
 
 jobs:
   preview-check:
@@ -13,21 +14,25 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 8
     steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          persist-credentials: false
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
         with:
           node-version: 22
       - name: Prepare bounded compression probes
         shell: python
         run: |
-          import gzip, json, pathlib
+          import json, pathlib
           root = pathlib.Path('asset-check')
           root.mkdir()
           payload = json.dumps({'kind': 'onedeck-asset-check', 'value': 'a' * (26 * 1024 * 1024)}).encode()
-          (root / 'probe.json').write_bytes(gzip.compress(payload, compresslevel=9, mtime=0))
-          (root / 'probe.wasm').write_bytes(gzip.compress(b'\x00asm\x01\x00\x00\x00', mtime=0))
+          (root / 'probe.json').write_bytes(payload)
+          (root / 'probe.wasm').write_bytes(b'\x00asm\x01\x00\x00\x00')
           (root / 'index.html').write_text('<!doctype html><title>OneDeck deployment asset check</title><p>Temporary deployment validation only. No game or credentials.</p>')
-          (root / '_headers').write_text('/probe.json\n  Content-Encoding: gzip\n  Content-Type: application/json\n  Cache-Control: no-store\n/probe.wasm\n  Content-Encoding: gzip\n  Content-Type: application/wasm\n  Cache-Control: no-store\n/*\n  X-Robots-Tag: noindex\n')
-          print('Raw JSON bytes:', len(payload), 'Uploaded JSON bytes:', (root / 'probe.json').stat().st_size)
+          (root / '_headers').write_text('/*\n  X-Robots-Tag: noindex\n')
+      - name: Package with the same gateway as the real build
+        run: python scripts/onedeck-publish/pack_assets.py asset-check --threshold 1
       - name: Publish only to an isolated preview branch
         env:
           CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
@@ -36,8 +41,8 @@ jobs:
         run: >-
           npx --yes wrangler@4.113.0 pages deploy asset-check
           --project-name=onedeck-play --branch=onedeck-asset-check
-          --commit-hash="$GITHUB_SHA" --commit-dirty=false
-      - name: Check browser-standard fetch decoding and streaming WASM
+          --commit-hash="$GITHUB_SHA" --commit-dirty=true
+      - name: Check decoding, streaming WASM, HEAD, ETag, and method rejection
         run: |
           node --input-type=module <<'JS'
           const base = 'https://onedeck-asset-check.onedeck-play.pages.dev';
@@ -51,7 +56,13 @@ jobs:
               const w = await fetch(`${base}/probe.wasm`, {signal: AbortSignal.timeout(30000)});
               if (!w.ok) throw new Error(`WASM status ${w.status}`);
               await WebAssembly.instantiateStreaming(w);
-              console.log('PASS: compressed JSON and streaming WASM decode correctly through Pages. Production unchanged.');
+              const h = await fetch(`${base}/probe.wasm`, {method: 'HEAD'});
+              if (!h.ok || h.headers.get('content-type') !== 'application/wasm') throw new Error('HEAD failed');
+              const cached = await fetch(`${base}/probe.wasm`, {headers: {'If-None-Match': h.headers.get('etag')}});
+              if (cached.status !== 304) throw new Error('ETag failed');
+              const rejected = await fetch(`${base}/probe.wasm`, {method: 'POST'});
+              if (rejected.status !== 405) throw new Error('Method rejection failed');
+              console.log('PASS: compressed JSON, streaming WASM, HEAD, ETag and method gate. Production unchanged.');
               last = null;
               break;
             } catch (e) { last = e; await new Promise(r => setTimeout(r, 3000)); }
@@ -59,6 +70,7 @@ jobs:
           if (last) throw last;
           JS
       - name: Inspect existing public site and lobby without authentication
+        if: always()
         shell: python
         run: |
           import json, re, urllib.request
