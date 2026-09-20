@@ -1,0 +1,48 @@
+name: OneDeck public endpoints
+
+on:
+  push:
+    branches: [deploy/onedeck-play]
+    paths: ['.github/workflows/onedeck-public-endpoints.yml']
+
+permissions: {}
+
+jobs:
+  inspect:
+    if: github.repository == 'Makeinu1/OneDeck' && github.ref == 'refs/heads/deploy/onedeck-play'
+    runs-on: ubuntu-latest
+    timeout-minutes: 3
+    steps:
+      - name: Read public endpoint status and lobby protocol only
+        run: |
+          node --input-type=module <<'JS'
+          for (const url of [
+            'https://onedeck-play.pages.dev/',
+            'https://onedeck-play.pages.dev/setup',
+            'https://81331ea7.onedeck-play.pages.dev/setup',
+            'https://onedeck-preview-lobby.makeinu1.workers.dev/health',
+            'https://onedeck-preview-lobby.makeinu1.workers.dev/',
+          ]) {
+            try {
+              const r = await fetch(url, {signal: AbortSignal.timeout(20000)});
+              console.log(JSON.stringify({url, status:r.status, contentType:r.headers.get('content-type')}));
+              if (url.endsWith('/health') && r.ok) {
+                const j = await r.json();
+                console.log(JSON.stringify({status:j.status, protocol_version:j.protocol_version, lobby_protocol_version:j.lobby_protocol_version, version:j.version}));
+              } else await r.body?.cancel();
+            } catch (error) { console.log(JSON.stringify({url, unavailable:error.name})); }
+          }
+          await new Promise(resolve => {
+            const socket = new WebSocket('wss://onedeck-preview-lobby.makeinu1.workers.dev/ws');
+            const timer = setTimeout(() => {socket.close(); console.log('Lobby hello timed out'); resolve();}, 15000);
+            socket.addEventListener('message', event => {
+              try {
+                const j=JSON.parse(event.data);
+                const d=j.data??j;
+                console.log(JSON.stringify({kind:'lobby-hello',type:j.type,protocol_version:d.protocol_version,lobby_protocol_version:d.lobby_protocol_version}));
+              } catch {console.log('Lobby replied without a JSON hello');}
+              clearTimeout(timer); socket.close(); resolve();
+            }, {once:true});
+            socket.addEventListener('error', () => {clearTimeout(timer); console.log('Lobby WebSocket connection failed'); resolve();}, {once:true});
+          });
+          JS
