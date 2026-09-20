@@ -1,0 +1,77 @@
+name: OneDeck Pages asset check
+
+on:
+  push:
+    branches: [deploy/onedeck-play]
+    paths: ['.github/workflows/onedeck-pages-asset-check.yml']
+
+permissions: {}
+
+jobs:
+  preview-check:
+    if: github.repository == 'Makeinu1/OneDeck' && github.ref == 'refs/heads/deploy/onedeck-play'
+    runs-on: ubuntu-latest
+    timeout-minutes: 8
+    steps:
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
+        with:
+          node-version: 22
+      - name: Prepare bounded compression probes
+        shell: python
+        run: |
+          import gzip, json, pathlib
+          root = pathlib.Path('asset-check')
+          root.mkdir()
+          payload = json.dumps({'kind': 'onedeck-asset-check', 'value': 'a' * (26 * 1024 * 1024)}).encode()
+          (root / 'probe.json').write_bytes(gzip.compress(payload, compresslevel=9, mtime=0))
+          (root / 'probe.wasm').write_bytes(gzip.compress(b'\x00asm\x01\x00\x00\x00', mtime=0))
+          (root / 'index.html').write_text('<!doctype html><title>OneDeck deployment asset check</title><p>Temporary deployment validation only. No game or credentials.</p>')
+          (root / '_headers').write_text('/probe.json\n  Content-Encoding: gzip\n  Content-Type: application/json\n  Cache-Control: no-store\n/probe.wasm\n  Content-Encoding: gzip\n  Content-Type: application/wasm\n  Cache-Control: no-store\n/*\n  X-Robots-Tag: noindex\n')
+          print('Raw JSON bytes:', len(payload), 'Uploaded JSON bytes:', (root / 'probe.json').stat().st_size)
+      - name: Publish only to an isolated preview branch
+        env:
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          WRANGLER_SEND_METRICS: 'false'
+        run: >-
+          npx --yes wrangler@4.113.0 pages deploy asset-check
+          --project-name=onedeck-play --branch=onedeck-asset-check
+          --commit-hash="$GITHUB_SHA" --commit-dirty=false
+      - name: Check browser-standard fetch decoding and streaming WASM
+        run: |
+          node --input-type=module <<'JS'
+          const base = 'https://onedeck-asset-check.onedeck-play.pages.dev';
+          let last;
+          for (let attempt = 0; attempt < 10; attempt++) {
+            try {
+              const r = await fetch(`${base}/probe.json`, {signal: AbortSignal.timeout(30000)});
+              if (!r.ok) throw new Error(`JSON status ${r.status}`);
+              const j = await r.json();
+              if (j.kind !== 'onedeck-asset-check' || j.value.length !== 26 * 1024 * 1024) throw new Error('Decoded JSON does not match');
+              const w = await fetch(`${base}/probe.wasm`, {signal: AbortSignal.timeout(30000)});
+              if (!w.ok) throw new Error(`WASM status ${w.status}`);
+              await WebAssembly.instantiateStreaming(w);
+              console.log('PASS: compressed JSON and streaming WASM decode correctly through Pages. Production unchanged.');
+              last = null;
+              break;
+            } catch (e) { last = e; await new Promise(r => setTimeout(r, 3000)); }
+          }
+          if (last) throw last;
+          JS
+      - name: Inspect existing public site and lobby without authentication
+        shell: python
+        run: |
+          import json, re, urllib.request
+          for url in ['https://onedeck-play.pages.dev/setup', 'https://onedeck-preview-lobby.makeinu1.workers.dev/health']:
+              try:
+                  with urllib.request.urlopen(url, timeout=20) as response:
+                      text = response.read(65536).decode('utf-8', errors='replace')
+                      print('Public URL:', url, 'HTTP:', response.status, 'Content-Type:', response.headers.get('Content-Type'))
+                      if url.endswith('/health'):
+                          data = json.loads(text)
+                          print({key: data.get(key) for key in ['status', 'protocol_version', 'lobby_protocol_version', 'version']})
+                      else:
+                          print('Title:', re.findall(r'<title>(.*?)</title>', text))
+                          print('Script assets:', re.findall(r'<script[^>]+src="([^"]+)"', text))
+              except Exception as error:
+                  print('Public inspection unavailable:', type(error).__name__)
