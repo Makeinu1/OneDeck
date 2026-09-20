@@ -74,7 +74,9 @@ jobs:
           cp LICENSE-MIT publication/licenses/phase-MIT.txt
           cp LICENSE-APACHE publication/licenses/phase-Apache-2.0.txt
           python scripts/onedeck-publish/pack_assets.py publication
-          node --check publication/_worker.js
+          test -s publication/_headers
+          test ! -e publication/_worker.js
+          test ! -e publication/_routes.json
       - name: Install isolated browser validation tools without deployment credentials
         run: |
           python -m venv /tmp/onedeck-smoke
