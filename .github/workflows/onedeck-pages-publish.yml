@@ -1,0 +1,138 @@
+name: OneDeck publish verified fork
+
+on:
+  push:
+    branches: [deploy/onedeck-play]
+    paths: ['.github/workflows/onedeck-pages-publish.yml']
+
+permissions:
+  contents: read
+  actions: read
+
+concurrency:
+  group: onedeck-production-publication
+  cancel-in-progress: false
+
+env:
+  SOURCE_SHA: '33343130cd47f566634cf000dd9270f5e7462552'
+  SOURCE_RUN: '35520380080'
+  WRANGLER_SEND_METRICS: 'false'
+
+jobs:
+  publish:
+    if: github.repository == 'Makeinu1/OneDeck' && github.event_name == 'push' && github.ref == 'refs/heads/deploy/onedeck-play'
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
+        with:
+          node-version: 22
+      - name: Await and verify exact-source build provenance (read only)
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: python
+        run: |
+          import json, os, time, urllib.request
+          url = 'https://api.github.com/repos/Makeinu1/OneDeck/actions/runs/' + os.environ['SOURCE_RUN']
+          deadline = time.monotonic() + 3600
+          print('Waiting only for the pinned source build; no Cloudflare credentials are present in this step.', flush=True)
+          while True:
+              req = urllib.request.Request(url, headers={'Authorization': 'Bearer ' + os.environ['GH_TOKEN'], 'Accept': 'application/vnd.github+json'})
+              with urllib.request.urlopen(req, timeout=30) as r:
+                  run = json.load(r)
+              assert run['head_repository']['full_name'] == 'Makeinu1/OneDeck'
+              assert run['head_branch'] == 'deploy/onedeck-play'
+              assert run['head_sha'] == os.environ['SOURCE_SHA']
+              assert run['path'] == '.github/workflows/onedeck-web-build.yml'
+              assert run['event'] == 'push'
+              if run['status'] == 'completed':
+                  assert run['conclusion'] == 'success', 'Source build did not succeed; publication is blocked'
+                  break
+              if time.monotonic() >= deadline:
+                  raise SystemExit('Source-build wait expired; publication was not attempted')
+              time.sleep(30)
+          print('Verified exact successful source build:', run['id'], run['head_sha'])
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          github-token: ${{ github.token }}
+          run-id: '35520380080'
+          name: onedeck-web-dist
+          path: publication
+      - name: Validate artifact and package bounded large assets
+        run: |
+          python - <<'PY'
+          import json, os, pathlib
+          manifest = json.loads(pathlib.Path('publication/onedeck-build.json').read_text())
+          assert manifest['repository'] == 'Makeinu1/OneDeck'
+          assert manifest['source_commit'] == os.environ['SOURCE_SHA']
+          assert manifest['source_run'] == os.environ['SOURCE_RUN']
+          PY
+          mkdir -p publication/licenses
+          cp LICENSE-MIT publication/licenses/phase-MIT.txt
+          cp LICENSE-APACHE publication/licenses/phase-Apache-2.0.txt
+          python scripts/onedeck-publish/pack_assets.py publication
+          node --check publication/_worker.js
+      - name: Install isolated browser validation tools without deployment credentials
+        run: |
+          python -m venv /tmp/onedeck-smoke
+          /tmp/onedeck-smoke/bin/pip install playwright==1.55.0
+          /tmp/onedeck-smoke/bin/python -m playwright install --with-deps chromium
+          npx --yes wrangler@4.113.0 --version
+      - name: Record existing production identity without modifying it
+        env:
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+        run: python scripts/onedeck-publish/pages_state.py --output publication-evidence/production-before.json
+      - name: Publish immutable candidate preview
+        id: preview
+        env:
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+        run: |
+          set -euo pipefail
+          npx --yes wrangler@4.113.0 pages deploy publication --project-name=onedeck-play --branch=onedeck-candidate --commit-hash="$SOURCE_SHA" --commit-dirty=true 2>&1 | tee /tmp/onedeck-preview.log
+          python - <<'PY'
+          import os, pathlib, re
+          urls = re.findall(r'https://[a-f0-9]{8,64}\.onedeck-play\.pages\.dev', pathlib.Path('/tmp/onedeck-preview.log').read_text())
+          assert urls, 'No immutable preview URL returned; inspect state before retrying publication'
+          with open(os.environ['GITHUB_OUTPUT'], 'a') as out:
+              out.write('url=' + urls[-1] + '\n')
+          PY
+      - name: Verify remote decoded bytes and direct SPA entry
+        env:
+          PREVIEW_URL: ${{ steps.preview.outputs.url }}
+        run: node scripts/onedeck-publish/verify_assets.mjs "$PREVIEW_URL" publication "$SOURCE_SHA"
+      - name: Exercise real browser setup, reload and game start
+        env:
+          PREVIEW_URL: ${{ steps.preview.outputs.url }}
+        run: /tmp/onedeck-smoke/bin/python scripts/onedeck-publish/smoke_web.py "$PREVIEW_URL" "$SOURCE_SHA" --output publication-evidence/preview
+      - name: Refuse to overwrite an independently changed production
+        env:
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+        run: python scripts/onedeck-publish/pages_state.py --unchanged-from publication-evidence/production-before.json
+      - name: Promote the same validated artifact to the production Pages branch
+        env:
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+        run: |
+          set -euo pipefail
+          npx --yes wrangler@4.113.0 pages deploy publication --project-name=onedeck-play --branch=main --commit-hash="$SOURCE_SHA" --commit-dirty=true
+          python scripts/onedeck-publish/pages_state.py --output publication-evidence/production-after.json
+      - name: Verify production source and game assets
+        run: node scripts/onedeck-publish/verify_assets.mjs https://onedeck-play.pages.dev publication "$SOURCE_SHA"
+      - name: Recheck production in a fresh browser
+        run: /tmp/onedeck-smoke/bin/python scripts/onedeck-publish/smoke_web.py https://onedeck-play.pages.dev "$SOURCE_SHA" --output publication-evidence/production
+      - name: Record result
+        run: |
+          printf '# OneDeck published\n\nURL: https://onedeck-play.pages.dev/setup\n\nApp source: `%s`\nBuild run: `%s`\n\nPreview and production browser startup and asset hashes passed. Full multiplayer-match conformance is not claimed.\n' "$SOURCE_SHA" "$SOURCE_RUN" >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        if: always()
+        with:
+          name: onedeck-publication-evidence
+          path: publication-evidence
+          if-no-files-found: warn
+          retention-days: 7
