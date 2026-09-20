@@ -3,6 +3,7 @@
 import argparse
 import json
 import re
+import time
 from pathlib import Path
 from urllib.parse import urlparse
 from playwright.sync_api import sync_playwright, expect
@@ -21,9 +22,11 @@ base = args.url.rstrip('/')
 out = Path(args.output)
 out.mkdir(parents=True, exist_ok=True)
 report = {'source_commit': args.source_sha, 'url': base, 'result': 'FAIL', 'checks': [], 'page_errors': [], 'http_errors': []}
+started = time.monotonic()
 
-# This is a normal stored deck, not a stubbed engine or a fabricated GameState.
-seed = '''() => {
+# A normal stored deck, not a stubbed engine or fabricated GameState.
+# Python add_init_script evaluates a script: it must invoke its initializer.
+seed = '''(() => {
   if (!location.hostname.endsWith('onedeck-play.pages.dev')) return;
   if (!localStorage.getItem('onedeck-smoke-seeded')) {
     localStorage.setItem('phase-deck:Deployment Smoke', JSON.stringify({
@@ -32,7 +35,7 @@ seed = '''() => {
     localStorage.setItem('phase-active-deck', 'Deployment Smoke');
     localStorage.setItem('onedeck-smoke-seeded', 'yes');
   }
-}'''
+})();'''
 
 with sync_playwright() as p:
     browser = p.chromium.launch(args=['--disable-dev-shm-usage'])
@@ -47,16 +50,16 @@ with sync_playwright() as p:
             report['http_errors'].append({'host': u.hostname, 'path': u.path, 'status': response.status})
     page.on('response', record_response)
     try:
-        manifest = context.request.get(base + '/onedeck-build.json', timeout=30000)
-        assert manifest.ok, 'Build provenance missing'
-        assert manifest.json()['source_commit'] == args.source_sha, 'Wrong published build'
-        report['checks'].append('exact published source commit')
         response = page.goto(base + '/setup?format=Commander', wait_until='domcontentloaded', timeout=60000)
         assert response and response.ok, 'Direct /setup navigation failed'
+        manifest = page.evaluate("async () => { const r = await fetch('/onedeck-build.json'); if (!r.ok) throw Error('Build provenance missing'); return r.json(); }")
+        assert manifest['source_commit'] == args.source_sha, 'Wrong published build'
+        report['checks'].append('exact published source commit read inside the browser')
+        assert page.evaluate("localStorage.getItem('phase-active-deck')") == 'Deployment Smoke', 'Test deck was not seeded'
         start = page.get_by_role('button', name=re.compile(r'^Start Match', re.I))
         expect(start).to_be_enabled(timeout=180000)
         page.screenshot(path=str(out / 'setup-desktop.png'), full_page=True)
-        report['checks'].append('setup renders and real engine validates stored Commander deck')
+        report['checks'].append('setup renders with selected stored Commander deck')
         page.reload(wait_until='domcontentloaded', timeout=60000)
         expect(start).to_be_enabled(timeout=120000)
         report['checks'].append('direct setup reload works')
@@ -75,9 +78,8 @@ with sync_playwright() as p:
         page.screenshot(path=str(out / 'game-started.png'), full_page=True)
         report['checks'].append('mulligan keep submitted through production UI and game board visible')
         assert not report['page_errors'], 'Uncaught browser exceptions'
-        # Layout is checked on the normal setup route, not by shrinking an active match.
-        awaitable = page.goto(base + '/setup?format=Commander', wait_until='domcontentloaded', timeout=60000)
-        assert awaitable and awaitable.ok
+        response = page.goto(base + '/setup?format=Commander', wait_until='domcontentloaded', timeout=60000)
+        assert response and response.ok
         page.set_viewport_size({'width': 390, 'height': 844})
         expect(start).to_be_visible(timeout=120000)
         page.screenshot(path=str(out / 'setup-mobile.png'), full_page=True)
@@ -90,6 +92,7 @@ with sync_playwright() as p:
             page.screenshot(path=str(out / 'last-screen.png'), full_page=True, timeout=10000)
         except Exception:
             pass
+        report['elapsed_seconds'] = round(time.monotonic() - started, 2)
         (out / 'report.json').write_text(json.dumps(report, indent=2) + '\n', encoding='utf-8')
         print(json.dumps(report, indent=2))
         browser.close()
