@@ -9,13 +9,22 @@ if (!/^[a-f0-9]{40}$/.test(expectedSha ?? '')) throw new Error('Exact source SHA
 const local = JSON.parse(fs.readFileSync(path.join(directory, 'onedeck-build.json'), 'utf8'));
 if (local.source_commit !== expectedSha) throw new Error('Local artifact source mismatch');
 const encoded = JSON.parse(fs.readFileSync(path.join(directory, 'encoded-assets.json'), 'utf8'));
-async function get(p) {
-  const r = await fetch(new URL(p, base), {signal: AbortSignal.timeout(120000), cache: 'no-store'});
+async function get(p, timeout = 120000) {
+  const r = await fetch(new URL(p, base), {signal: AbortSignal.timeout(timeout), cache: 'no-store'});
   if (!r.ok) throw new Error(`${p}: HTTP ${r.status}`);
   return r;
 }
-const receipt = await (await get('/onedeck-build.json')).json();
-if (JSON.stringify(receipt) !== JSON.stringify(local)) throw new Error('Remote artifact provenance differs');
+// Retry only small public reads while the edge publishes the new deployment.
+// This never retries a deployment or accepts a different build as equivalent.
+let visible = false;
+for (let attempt = 0; attempt < 12; attempt++) {
+  try {
+    const receipt = await (await get('/onedeck-build.json', 10000)).json();
+    if (JSON.stringify(receipt) === JSON.stringify(local)) { visible = true; break; }
+  } catch { /* exact provenance remains required after bounded propagation */ }
+  await new Promise(resolve => setTimeout(resolve, 5000));
+}
+if (!visible) throw new Error('Exact remote artifact provenance did not become visible');
 const checks = new Map(Object.entries(encoded).map(([p, v]) => [p, {sha256: v.sha256, type: v.type}]));
 const cardPath = `/card-data-${local.card_data_sha256.slice(0, 16)}.json`;
 checks.set(cardPath, {sha256: local.card_data_sha256, type: 'application/json'});
