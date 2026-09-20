@@ -1,0 +1,123 @@
+name: OneDeck web build
+
+on:
+  push:
+    branches: [deploy/onedeck-play]
+    paths:
+      - '.github/workflows/onedeck-web-build.yml'
+      - 'scripts/onedeck-build/**'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: onedeck-web-build
+  cancel-in-progress: false
+
+jobs:
+  build:
+    if: github.repository == 'Makeinu1/OneDeck' && github.ref == 'refs/heads/deploy/onedeck-play'
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    env:
+      CARGO_BUILD_JOBS: '2'
+      CARGO_INCREMENTAL: '0'
+      TELEMETRY_URL: ''
+      SUPABASE_URL: ''
+      SUPABASE_ANON_KEY: ''
+      OFFICIAL_MULTIPLAYER_SERVER_URL: 'wss://onedeck-preview-lobby.makeinu1.workers.dev/ws'
+      DEFAULT_MULTIPLAYER_SERVER_URL: 'wss://onedeck-preview-lobby.makeinu1.workers.dev/ws'
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          persist-credentials: false
+      - uses: pnpm/action-setup@b906affcce14559ad1aafd4ab0e942779e9f58b1
+        with:
+          version: 9.15.9
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
+        with:
+          node-version: 22
+          cache: pnpm
+          cache-dependency-path: client/pnpm-lock.yaml
+      - uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659
+        with:
+          targets: wasm32-unknown-unknown
+          rustflags: ''
+          cache-shared-key: onedeck-web
+          cache-on-failure: true
+      - uses: taiki-e/install-action@e67fa11c4b9316fa714ddf0abed07a0c3143b95b
+        with:
+          tool: wasm-bindgen-cli@0.2.121
+      - uses: ./.github/actions/binaryen
+      - name: Install frozen frontend dependencies
+        run: cd client && pnpm install --frozen-lockfile
+      - name: Generate and validate fork card data
+        run: ./scripts/gen-card-data.sh
+      - name: Preserve completed data work independently of later build results
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: onedeck-generated-data
+          path: |
+            client/public/*.json
+            crates/engine/data/known-tokens.toml
+            crates/engine/data/oracle-subtypes.json
+            crates/engine/data/mtgjson-vintage
+          if-no-files-found: error
+          retention-days: 7
+      - name: Build exact WASM pair from the same generated inputs
+        run: ./scripts/build-wasm.sh release
+      - name: Preserve compiled WASM
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: onedeck-wasm
+          path: client/src/wasm/*
+          if-no-files-found: error
+          retention-days: 7
+      - name: Generate runtime image metadata
+        run: |
+          ./scripts/gen-scryfall-images.sh
+          ./scripts/gen-scryfall-token-images.sh
+          ./scripts/gen-scryfall-printings.sh
+          ./scripts/gen-scryfall-locale-images.sh
+          ./scripts/gen-scryfall-sets.sh
+      - name: Generate draft pools using the existing pipeline
+        run: |
+          ./scripts/fetch-draft-sets.sh
+          cargo run --locked --profile tool --bin draft-pool-gen -- data/mtgjson/sets client/public/draft-pools.json
+      - name: Build web app with pinned local card-data URL
+        run: |
+          set -euo pipefail
+          DATA_HASH=$(sha256sum client/public/card-data.json | cut -c1-16)
+          export CARD_DATA_URL="/card-data-${DATA_HASH}.json"
+          cd client
+          pnpm build
+      - name: Record output sizes and build provenance
+        shell: python
+        run: |
+          import hashlib, json, os, pathlib, subprocess
+          root = pathlib.Path('client/dist')
+          assert (root / 'index.html').is_file(), 'Missing built app'
+          files = sorted(p for p in root.rglob('*') if p.is_file())
+          big = [{'path': str(p.relative_to(root)), 'bytes': p.stat().st_size} for p in files if p.stat().st_size > 25 * 1024 * 1024]
+          record = {
+              'repository': 'Makeinu1/OneDeck',
+              'source_commit': os.environ['GITHUB_SHA'],
+              'source_run': os.environ['GITHUB_RUN_ID'],
+              'card_data_sha256': hashlib.sha256(pathlib.Path('client/public/card-data.json').read_bytes()).hexdigest(),
+              'wasm_sha256': hashlib.sha256(pathlib.Path('client/src/wasm/engine_wasm_bg.wasm').read_bytes()).hexdigest(),
+              'generated_catalog_diff': subprocess.check_output(['git', 'diff', '--stat', '--', 'crates/engine/data'], text=True),
+              'oversized_assets': big,
+              'deployment': 'NOT_PERFORMED',
+          }
+          (root / 'onedeck-build.json').write_text(json.dumps(record, indent=2) + '\n')
+          print(json.dumps(record, indent=2))
+          with open(os.environ['GITHUB_STEP_SUMMARY'], 'a') as out:
+              out.write('# Fork web build\n\nSource: `' + os.environ['GITHUB_SHA'] + '`\n\nNo Cloudflare secrets or publication were used.\n\n')
+              out.write('Oversized asset inventory:\n```json\n' + json.dumps(big, indent=2) + '\n```\n')
+      - name: Upload complete web build for separate publication review
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: onedeck-web-dist
+          path: client/dist
+          if-no-files-found: error
+          retention-days: 7
