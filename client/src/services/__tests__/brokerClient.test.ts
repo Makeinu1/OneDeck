@@ -381,3 +381,58 @@ describe("broker client keepalive", () => {
     }
   });
 });
+
+describe("broker host registration privacy", () => {
+  it("sends only the protocol's empty deck placeholder", async () => {
+    const ws = new MockWebSocket();
+    const client = makeBrokerClient(makePhaseSocket(ws));
+    const registration = client.registerHost({
+      hostPeerId: "peer-host",
+      displayName: "Host",
+      public: true,
+      password: null,
+      timerSeconds: null,
+      playerCount: 2,
+      matchConfig: { match_type: "Bo1" },
+      formatConfig: null,
+      roomName: null,
+      draftMetadata: null,
+    });
+
+    const lastCall = ws.send.mock.calls[ws.send.mock.calls.length - 1];
+    const frame = JSON.parse(lastCall?.[0] as string) as {
+      type: string;
+      data: {
+        deck: Record<string, unknown>;
+        ai_seats: unknown[];
+        host_peer_id: string;
+      };
+    };
+    expect(frame.type).toBe("CreateGameWithSettings");
+    expect(frame.data.host_peer_id).toBe("peer-host");
+    expect(frame.data.deck).toEqual({
+      main_deck: [],
+      sideboard: [],
+      commander: [],
+      planar_deck: [],
+      scheme_deck: [],
+    });
+    expect(frame.data.ai_seats).toEqual([]);
+    const wire = JSON.stringify(frame);
+    for (const marker of ["Forest", "AI_SECRET_DECK", "saved-state-marker"]) {
+      expect(wire).not.toContain(marker);
+    }
+
+    ws.deliver(
+      JSON.stringify({
+        type: "GameCreated",
+        data: { game_code: "ABC123", player_token: "token" },
+      }),
+    );
+    await expect(registration).resolves.toEqual({
+      gameCode: "ABC123",
+      playerToken: "token",
+    });
+    client.close();
+  });
+});
