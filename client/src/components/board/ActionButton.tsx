@@ -21,6 +21,17 @@ type ActionButtonMode =
   | "priority-empty"
   | "hidden";
 
+function ShortcutKey({ children }: { children: string }) {
+  return (
+    <kbd
+      aria-hidden="true"
+      className="ml-1 rounded border border-white/15 bg-black/25 px-1.5 py-0.5 font-mono text-[10px] font-semibold tracking-wide text-white/60"
+    >
+      {children}
+    </kbd>
+  );
+}
+
 function getActionButtonMode(
   waitingFor: WaitingFor | null | undefined,
   stackLength: number,
@@ -404,7 +415,10 @@ export function ActionButton() {
               aria-describedby={resolveTooltipId}
               className={gameButtonClass({ tone: "blue", size: "md", disabled: actionBlocked, className: `${primaryButtonClass} group relative` })}
             >
-              {t("actionButton.resolve")}
+              <span className="inline-flex items-center justify-center gap-1">
+                {t("actionButton.resolve")}
+                <ShortcutKey>Space</ShortcutKey>
+              </span>
               <GameplayTooltip id={resolveTooltipId}>
                 {t("actionButton.resolveTooltip")}
               </GameplayTooltip>
@@ -477,7 +491,10 @@ export function ActionButton() {
                   className: `${primaryButtonClass} group relative`,
                 })}
               >
-                {advanceLabel}
+                <span className="inline-flex items-center justify-center gap-1">
+                  {advanceLabel}
+                  <ShortcutKey>Space</ShortcutKey>
+                </span>
                 <GameplayTooltip id={priorityTooltipId}>
                   {t("actionButton.priorityTooltip")}
                 </GameplayTooltip>
@@ -499,6 +516,7 @@ export function ActionButton() {
                 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 20 20" fill="currentColor" className="h-4 w-4">
                   <path fillRule="evenodd" d="M2 10a.75.75 0 0 1 .75-.75h12.59l-2.1-1.95a.75.75 0 1 1 1.02-1.1l3.5 3.25a.75.75 0 0 1 0 1.1l-3.5 3.25a.75.75 0 1 1-1.02-1.1l2.1-1.95H2.75A.75.75 0 0 1 2 10Z" clipRule="evenodd" />
                 </svg>
+                <ShortcutKey>Enter</ShortcutKey>
               </span>
               <GameplayTooltip id={passToEndTooltipId} className="w-56">
                 {t("actionButton.passToEndTooltip")}
