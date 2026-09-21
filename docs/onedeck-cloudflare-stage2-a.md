@@ -52,6 +52,12 @@ node scripts/probe-onedeck-authority.mjs \
 inputs are present and the conservative gates pass; it must not be used as a
 substitute for a deployed Worker/DO measurement.
 
+When Rust/WASM is not installed locally, the manual **OneDeck authority
+feasibility probe** workflow performs the same release build on a GitHub runner
+and uploads only `onedeck-authority-probe.json`. It has read-only repository
+permissions and no Cloudflare/TURN secrets. A report with `status: "fail"` is a
+useful measured stop signal; it is not a workflow failure.
+
 ## Acceptance and stop conditions
 
 Stage 2-A is complete when the probe and its `node:test` coverage are green in

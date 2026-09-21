@@ -1,0 +1,62 @@
+name: OneDeck authority feasibility probe
+
+# Manual and measurement-only. This workflow builds the ignored release
+# artifacts on a runner, then uploads only the small JSON report. It does not
+# deploy Pages/R2/Workers and has no Cloudflare or TURN secrets.
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  probe:
+    name: Measure release card data and engine WASM
+    runs-on: ubuntu-latest
+    timeout-minutes: 55
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: 22
+
+      - uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 # v1.17.0
+        with:
+          target: wasm32-unknown-unknown
+          cache: false
+          rustflags: ""
+
+      - uses: taiki-e/install-action@e67fa11c4b9316fa714ddf0abed07a0c3143b95b # v2.87.4
+        with:
+          tool: wasm-bindgen-cli@0.2.121
+
+      - uses: ./.github/actions/binaryen
+        with:
+          cache: "false"
+
+      - name: Generate card data
+        run: ./scripts/gen-card-data.sh
+
+      - name: Build release engine and draft WASM
+        run: ./scripts/build-wasm.sh release
+
+      - name: Run authority probe
+        run: |
+          node scripts/probe-onedeck-authority.mjs \
+            --card-data client/public/card-data.json \
+            --engine-wasm client/src/wasm/engine_wasm_bg.wasm \
+            --engine-glue client/src/wasm/engine_wasm.js \
+            --json | tee onedeck-authority-probe.json
+          cat onedeck-authority-probe.json >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload probe report
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: onedeck-authority-probe
+          path: onedeck-authority-probe.json
+          if-no-files-found: warn
+          retention-days: 14
