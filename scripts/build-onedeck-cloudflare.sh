@@ -15,6 +15,7 @@ set -euo pipefail
 #   ONEDECK_GENERATE_DATA=1      run the card-data generator first
 #   ONEDECK_UPLOAD_R2=0          prepare and verify locally, do not upload
 #   ONEDECK_VERIFY_R2=0          skip remote header/round-trip checks
+#   ONEDECK_R2_STAGING_DIR      persist gzip objects for a separate upload step
 
 cd "$(dirname "${BASH_SOURCE[0]}")/.."
 
@@ -28,6 +29,7 @@ WORKER_URL="${ONEDECK_WORKER_URL%/}"
 PAGES_ORIGIN="${ONEDECK_PAGES_ORIGIN%/}"
 UPLOAD_R2="${ONEDECK_UPLOAD_R2:-0}"
 VERIFY_R2="${ONEDECK_VERIFY_R2:-0}"
+STAGING_DIR="${ONEDECK_R2_STAGING_DIR:-}"
 
 case "$PAGES_ORIGIN" in
   https://*) ;;
@@ -112,13 +114,39 @@ r2_put_gzip() {
     --content-encoding gzip --cache-control "$cache_control")
 }
 
-if [ "$UPLOAD_R2" = "1" ]; then
-  r2_put_gzip "$CARD_GZIP" "$CARD_DATA_KEY" application/json \
-    "public, max-age=31536000, immutable"
-  r2_put_gzip "$WASM_GZIP" "$ENGINE_WASM_KEY" application/wasm \
-    "public, max-age=31536000, immutable"
-  r2_put_gzip "$DRAFT_WASM_GZIP" "$DRAFT_WASM_KEY" application/wasm \
-    "public, max-age=31536000, immutable"
+if [ "$UPLOAD_R2" = "1" ] || [ -n "$STAGING_DIR" ]; then
+  if [ -n "$STAGING_DIR" ]; then
+    mkdir -p "$STAGING_DIR"
+    rm -f "$STAGING_DIR/manifest.json" \
+      "$STAGING_DIR/$CARD_DATA_KEY.gz" \
+      "$STAGING_DIR/$ENGINE_WASM_KEY.gz" \
+      "$STAGING_DIR/$DRAFT_WASM_KEY.gz"
+    cp "$CARD_GZIP" "$STAGING_DIR/$CARD_DATA_KEY.gz"
+    cp "$WASM_GZIP" "$STAGING_DIR/$ENGINE_WASM_KEY.gz"
+    cp "$DRAFT_WASM_GZIP" "$STAGING_DIR/$DRAFT_WASM_KEY.gz"
+    staged_assets='[]'
+    staged_assets="$(jq --arg key "$CARD_DATA_KEY" \
+      --arg file "$CARD_DATA_KEY.gz" \
+      '. + [{key: $key, file: $file, content_type: "application/json", cache_control: "public, max-age=31536000, immutable"}]' \
+      <<<"$staged_assets")"
+    staged_assets="$(jq --arg key "$ENGINE_WASM_KEY" \
+      --arg file "$ENGINE_WASM_KEY.gz" \
+      '. + [{key: $key, file: $file, content_type: "application/wasm", cache_control: "public, max-age=31536000, immutable"}]' \
+      <<<"$staged_assets")"
+    staged_assets="$(jq --arg key "$DRAFT_WASM_KEY" \
+      --arg file "$DRAFT_WASM_KEY.gz" \
+      '. + [{key: $key, file: $file, content_type: "application/wasm", cache_control: "public, max-age=31536000, immutable"}]' \
+      <<<"$staged_assets")"
+  fi
+
+  if [ "$UPLOAD_R2" = "1" ]; then
+    r2_put_gzip "$CARD_GZIP" "$CARD_DATA_KEY" application/json \
+      "public, max-age=31536000, immutable"
+    r2_put_gzip "$WASM_GZIP" "$ENGINE_WASM_KEY" application/wasm \
+      "public, max-age=31536000, immutable"
+    r2_put_gzip "$DRAFT_WASM_GZIP" "$DRAFT_WASM_KEY" application/wasm \
+      "public, max-age=31536000, immutable"
+  fi
 
   while IFS= read -r filename; do
     source="client/public/$filename"
@@ -128,9 +156,23 @@ if [ "$UPLOAD_R2" = "1" ]; then
     }
     output="$TMP_DIR/$filename.gz"
     gzip_asset "$source" "$output"
-    r2_put_gzip "$output" "$filename" application/json \
-      "public, max-age=60, must-revalidate"
+    if [ "$UPLOAD_R2" = "1" ]; then
+      r2_put_gzip "$output" "$filename" application/json \
+        "public, max-age=60, must-revalidate"
+    fi
+    if [ -n "$STAGING_DIR" ]; then
+      cp "$output" "$STAGING_DIR/$filename.gz"
+      staged_assets="$(jq --arg key "$filename" \
+        --arg file "$filename.gz" \
+        '. + [{key: $key, file: $file, content_type: "application/json", cache_control: "public, max-age=60, must-revalidate"}]' \
+        <<<"$staged_assets")"
+    fi
   done < <(jq -r '.[]' data-files.json)
+
+  if [ -n "$STAGING_DIR" ]; then
+    jq -n --argjson assets "$staged_assets" '{assets: $assets}' \
+      > "$STAGING_DIR/manifest.json"
+  fi
 fi
 
 if [ "$VERIFY_R2" = "1" ]; then

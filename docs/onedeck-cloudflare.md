@@ -48,7 +48,8 @@ audience.
 
 - generates card data and the release WASM when requested by CI;
 - computes SHA-256 names from the uncompressed card, engine-WASM, and draft-WASM bytes;
-- creates deterministic `gzip -9 -n` objects and uploads them with
+- creates deterministic `gzip -9 -n` objects, stages them for the isolated R2
+  upload step, and uploads them with
   `Content-Encoding: gzip`, the correct MIME type, and immutable cache headers;
 - builds Vite with the dedicated Worker/R2 URLs and empty Supabase/telemetry
   settings;
