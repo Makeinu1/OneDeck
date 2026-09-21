@@ -25,7 +25,7 @@ function ShortcutKey({ children }: { children: string }) {
   return (
     <kbd
       aria-hidden="true"
-      className="ml-1 rounded border border-white/15 bg-black/25 px-1.5 py-0.5 font-mono text-[10px] font-semibold tracking-wide text-white/60"
+      className="ml-1 hidden rounded border border-white/15 bg-black/25 px-1.5 py-0.5 font-mono text-[10px] font-semibold tracking-wide text-white/60 lg:inline-flex"
     >
       {children}
     </kbd>
