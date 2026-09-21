@@ -167,6 +167,7 @@
     "backToImport": "インポートに戻る",
     "errorInvalidUrl": "有効なMoxfieldまたはArchidektデッキURLを入力してください。",
     "errorOffline": "オフライン中はURLからインポートできません。テキスト貼り付けまたはファイルからを使用してください。",
+    "errorUnavailable": "この環境ではURLからインポートできません。テキスト貼り付けまたはファイルからを使用してください。",
     "errorNetworkFailure": "デッキインポートサービスに接続できませんでした。接続を確認して、もう一度試してください。",
     "errorGeneric": "デッキのインポートに失敗しました。",
     "errorNoOathbreaker": "このリストに使用可能なオースブレイカーがありません。",

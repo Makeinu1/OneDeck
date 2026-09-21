@@ -167,6 +167,7 @@
     "backToImport": "Voltar à importação",
     "errorInvalidUrl": "Insira um URL válido de deck Moxfield ou Archidekt.",
     "errorOffline": "Importações por URL não estão disponíveis offline. Use Colar Texto ou De Arquivo.",
+    "errorUnavailable": "Importações por URL não estão disponíveis nesta publicação. Use Colar Texto ou De Arquivo.",
     "errorNetworkFailure": "Não foi possível contactar o serviço de importação. Verifique sua conexão e tente novamente.",
     "errorGeneric": "Falha ao importar o deck.",
     "errorNoOathbreaker": "Esta lista não tem um Oathbreaker elegível.",

@@ -1,6 +1,6 @@
 import { afterEach, beforeEach, expect, it, vi } from "vitest";
 
-import { runConnectivityDiagnostics } from "../connectivityDiagnostics";
+import { nativeDiagnosticPeerOptions, runConnectivityDiagnostics } from "../connectivityDiagnostics";
 import { fetchFreshTurnConfig, PEER_CONNECT_OPTIONS, TurnCredentialError } from "../connection";
 import { getDiagnosticSources } from "../../services/troubleshooting";
 
@@ -36,6 +36,14 @@ let outgoing: Connection;
 let incoming: Connection;
 let controller: AbortController;
 const credentials = vi.mocked(fetchFreshTurnConfig);
+
+it("uses the guest-to-host dial direction for self-hosted signaling", () => {
+  expect(nativeDiagnosticPeerOptions(["guest-id", "host-id"])).toEqual([
+    { id: "guest-id", role: "guest", hostPeerId: "host-id" },
+    { id: "host-id", role: "host", hostPeerId: "host-id" },
+  ]);
+});
+
 beforeEach(() => {
   vi.useFakeTimers();
   vi.stubGlobal("RTCPeerConnection", class {});

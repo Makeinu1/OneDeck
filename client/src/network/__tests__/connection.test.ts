@@ -66,7 +66,7 @@ vi.mock("peerjs", () => {
   return { default: FakePeer };
 });
 
-import { dialPeer, fetchFreshTurnConfig, safePeerError, PEER_CONNECT_OPTIONS, TURN_CREDENTIALS_URL, hostRoom, joinRoom, logSelectedIceCandidate } from "../connection";
+import { dialPeer, fetchFreshTurnConfig, isRetriableHostRegistrationError, safePeerError, PEER_CONNECT_OPTIONS, TURN_CREDENTIALS_URL, hostRoom, joinRoom, logSelectedIceCandidate } from "../connection";
 
 import { getDiagnosticHistory } from "../../services/troubleshooting";
 
@@ -300,6 +300,20 @@ describe("joinRoom", () => {
     host.destroy();
     await vi.advanceTimersByTimeAsync(60_000);
     expect(peerState.reconnectCalls).toBe(1);
+  });
+});
+
+describe("self-hosted host registration retry", () => {
+  it.each([
+    [true, "network", true],
+    [true, "socket-closed", true],
+    [true, "unavailable-id", true],
+    [true, "network", false],
+    [false, "network", true],
+  ])("classifies %s/%s/selfHosted=%s", (allow, errorType, selfHosted) => {
+    expect(isRetriableHostRegistrationError(allow, errorType, selfHosted)).toBe(
+      allow && (errorType === "unavailable-id" || (selfHosted && (errorType === "network" || errorType === "socket-closed"))),
+    );
   });
 });
 

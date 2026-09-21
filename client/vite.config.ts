@@ -177,9 +177,18 @@ function dataFileDefines(mode: string, buildHash: string): Record<string, string
     // fallback build-time-only so an external profile cannot retain the
     // official import endpoint as a dead string in its Pages bundle.
     __IMPORT_DECK_BASE__: JSON.stringify(
-      process.env.VITE_IMPORT_DECK_URL ||
-        (mode === "development" ? "" : "https://lobby.phase-rs.dev"),
+      process.env.ONEDECK_CLOUDFLARE_PROFILE === "1"
+        ? ""
+        : process.env.VITE_IMPORT_DECK_URL ??
+          (mode === "development" ? "" : "https://lobby.phase-rs.dev"),
     ),
+    __URL_DECK_IMPORT_ENABLED__: JSON.stringify(
+      process.env.ONEDECK_CLOUDFLARE_PROFILE !== "1",
+    ),
+    __SELF_HOSTED_SIGNALING__: JSON.stringify(
+      process.env.ONEDECK_CLOUDFLARE_PROFILE === "1",
+    ),
+    __PEER_SIGNALING_URL__: JSON.stringify(process.env.PEER_SIGNALING_URL ?? ""),
     // P2P builds may use a dedicated Worker for ephemeral TURN credentials.
     // Keep the official endpoint as the upstream-compatible default; the
     // OneDeck Cloudflare profile supplies its own Worker URL at build time.

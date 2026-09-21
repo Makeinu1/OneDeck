@@ -8,13 +8,16 @@ from the phase.rs production lobby and TURN credentials:
 Pages (shell, JS/CSS, small images)
         │
         ├── OneDeck R2 (gzip card data + gzip engine/draft WASM)
-        └── OneDeck Worker (lobby/signaling + short-lived TURN mint)
+        └── OneDeck Worker (lobby broker + WebRTC signaling + short-lived TURN mint)
 ```
 
-The Worker uses the existing `lobby-worker/src` implementation, but
-`lobby-worker/wrangler.onedeck.toml` gives it a different Worker name and a new
-SQLite-backed Durable Object namespace. No official lobby rooms, directory, or
-TURN token is shared.
+The Worker reuses the lobby implementation behind the narrow
+`lobby-worker/src/onedeck.ts` entry point. `lobby-worker/wrangler.onedeck.toml`
+gives it a different Worker name and a new SQLite-backed Durable Object
+namespace. No official lobby rooms, directory, import service, or TURN token
+is shared. The lobby WebSocket admits only the configured Pages origin as a
+browser-origin abuse guard; this is not authentication because non-browser
+clients can forge an `Origin` header.
 
 ## Operator setup
 
@@ -52,7 +55,8 @@ audience.
   upload step, and uploads them with
   `Content-Encoding: gzip`, the correct MIME type, and immutable cache headers;
 - builds Vite with the dedicated Worker/R2 URLs and empty Supabase/telemetry
-  settings;
+  settings. The OneDeck profile leaves URL-based deck import disabled, so a
+  deck is entered from the local file/paste path and never crosses the lobby;
 - removes every entry from `data-files.json`, the content-addressed card JSON,
   and both WASM binaries from `client/dist`;
 - copies the Cloudflare `_headers` file and the SPA fallback;
@@ -66,6 +70,13 @@ WASM instantiation. The script therefore hashes the raw bytes, not the gzip
 container, so a deployment cannot pair a WASM build with a different card
 schema.
 
+The privacy promise here is about the published artifact and the broker wire:
+player decks, browser saves, and authoritative match state are not placed in
+Pages, R2, the lobby registration payload, or SignalDO. LobbyDO may still keep
+room-admission data such as a room password or reservation token in its private
+Durable Object snapshot; that is not public artifact data and is not a claim
+that no secret is ever stored at rest.
+
 ## Play flow and authority boundary
 
 `/setup` now offers both **AIとプレイ** and **対人プレイ**. The AI button keeps
@@ -75,11 +86,13 @@ seats and still allows the supported 2–6 player P2P range.
 
 For this free-tier profile, solo runs the Phase WASM engine in the browser and
 multiplayer uses the existing host-authoritative P2P adapter. The dedicated
-Worker brokers room/signaling and mints TURN credentials; it does not run the
-Phase game engine or persist authoritative match state. A server-authoritative
-Durable Object is deliberately a separate feasibility project because loading
-the full card corpus and native server dependencies into a 128 MiB Worker is a
-different architecture.
+Worker brokers the room, relays only WebRTC signaling metadata through an
+ephemeral SignalDO, and mints TURN credentials; it does not run the Phase game
+engine or persist authoritative match state. The OneDeck build selects the
+native `RTCPeerConnection` transport, so it has no dependency on the PeerJS
+cloud signaling service. A server-authoritative Durable Object is deliberately
+a separate feasibility project because loading the full card corpus and native
+server dependencies into a 128 MiB Worker is a different architecture.
 
 Stage 2-A keeps that boundary explicit and provides a measurement-only probe
 for the existing engine-WASM build: see
@@ -106,4 +119,6 @@ alone does not prove browser CORS behavior.
 In two browser profiles, open `/setup`, start a solo match through the first
 priority action, then host and join a two-player room through the same entry
 point. Browser network logs must show the OneDeck Worker/R2 hosts and no
-`lobby.phase-rs.dev` or `phase-rs.dev/turn-credentials` request.
+`lobby.phase-rs.dev`, `phase-rs.dev/turn-credentials`, or `0.peerjs.com`
+request. The latter check also catches an accidental fallback to the upstream
+PeerJS cloud rather than the OneDeck signaling route.
