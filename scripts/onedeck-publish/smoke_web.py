@@ -71,7 +71,7 @@ with sync_playwright() as p:
         # Older builds could go directly to Keep, so handle the reveal only
         # when present instead of making either ordering a publication rule.
         if not keep.is_visible():
-            reveal = page.get_by_role('button', name=re.compile(r'^Tap to continue
+            reveal = page.get_by_role('button', name=re.compile(r'Tap to continue', re.I)).first
             reveal_deadline = time.monotonic() + 30
             advanced_reveal = False
             while time.monotonic() < reveal_deadline and not keep.is_visible():
