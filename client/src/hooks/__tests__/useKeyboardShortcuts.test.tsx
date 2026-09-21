@@ -66,6 +66,34 @@ describe("useKeyboardShortcuts", () => {
     expect(directDispatch).not.toHaveBeenCalled();
   });
 
+  it("space does not submit when another seat owns the priority decision", () => {
+    const directDispatch = vi.fn().mockResolvedValue([]);
+    const gameState = buildGameState({
+      waiting_for: buildPriorityWaitingFor({ data: { player: 1 } }),
+      priority_player: 1,
+    });
+
+    act(() => {
+      useGameStore.setState({
+        gameMode: "ai",
+        gameState,
+        waitingFor: gameState.waiting_for,
+        dispatch: directDispatch,
+        undo: vi.fn(),
+        stateHistory: [],
+      });
+    });
+
+    render(<KeyboardHarness />);
+
+    act(() => {
+      window.dispatchEvent(new KeyboardEvent("keydown", { key: " " }));
+    });
+
+    expect(dispatchActionMock).not.toHaveBeenCalled();
+    expect(directDispatch).not.toHaveBeenCalled();
+  });
+
   it("escape skips an optional trigger target through the engine action", () => {
     const dispatch = vi.fn().mockResolvedValue([]);
     const gameState = buildGameState({
