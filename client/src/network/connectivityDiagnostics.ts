@@ -1,12 +1,28 @@
 import Peer, { type DataConnection } from "peerjs";
 
 import { connectionFailureSnapshot, fetchFreshTurnConfig, PEER_CONNECT_OPTIONS, safeConnectionError, safePeerError, TurnCredentialError } from "./connection";
+import { NativePeer } from "./nativeSignaling";
 import { boundedDiagnosticProbe, projectCandidateStats, type DiagnosticProbeEvidence, type DiagnosticResult } from "../services/troubleshooting";
 
 const CHALLENGE = "phase-relay-check-v1";
 const CREDENTIAL_TIMEOUT_MS = 8_000;
 const SIGNALING_TIMEOUT_MS = 10_000;
 const RELAY_TIMEOUT_MS = 15_000;
+
+/**
+ * Native signaling follows the game transport's direction: the guest creates
+ * the offer and dials the host. The generic PeerJS diagnostic keeps its
+ * historical ordering below; only the self-hosted profile uses this plan.
+ */
+export function nativeDiagnosticPeerOptions(ids: readonly [string, string]): [
+  { id: string; role: "guest"; hostPeerId: string },
+  { id: string; role: "host"; hostPeerId: string },
+] {
+  return [
+    { id: ids[0], role: "guest", hostPeerId: ids[1] },
+    { id: ids[1], role: "host", hostPeerId: ids[1] },
+  ];
+}
 
 /** An isolated PeerJS/BinaryPack round trip, using the game's signaling defaults. */
 export async function runConnectivityDiagnostics(signal: AbortSignal): Promise<DiagnosticResult[]> {
@@ -66,13 +82,20 @@ export async function runConnectivityDiagnostics(signal: AbortSignal): Promise<D
   const rejectIncoming = (connection: DataConnection) => closeConnection(connection);
   let signalingFailure: ReturnType<typeof safePeerError> | undefined;
   try {
-    const ids = [crypto.randomUUID(), crypto.randomUUID()].map((id) => `phase-diagnostics-${id}`);
+    const ids = [crypto.randomUUID(), crypto.randomUUID()].map((id) => `phase-diagnostics-${id}`) as [string, string];
     const signalingStarted = Date.now();
     let registered = 0;
     try {
       await stage<void>(SIGNALING_TIMEOUT_MS, (resolve, reject) => {
-        for (const id of ids) {
-          const peer = new Peer(id, { config: { ...config, iceTransportPolicy: "relay" } });
+        const nativeOptions = nativeDiagnosticPeerOptions(ids);
+        for (const [index, id] of ids.entries()) {
+          const peer = (__SELF_HOSTED_SIGNALING__
+            ? new NativePeer({
+                ...nativeOptions[index],
+                config: { ...config, iceTransportPolicy: "relay" },
+                signalingBaseUrl: __PEER_SIGNALING_URL__,
+              })
+            : new Peer(id, { config: { ...config, iceTransportPolicy: "relay" } })) as unknown as Peer;
           peers.push(peer);
           const onError = (error: unknown) => {
             const type = safePeerError(error);

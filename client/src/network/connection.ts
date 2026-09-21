@@ -2,6 +2,7 @@ import Peer from "peerjs";
 import { diagnosticIdFor, recordDiagnostic } from "../services/troubleshooting";
 import type { ConnectionDiagnosticError, ConnectionFailureSnapshot, PeerDiagnosticError, TurnCredentialFailure } from "../services/troubleshooting";
 import type { DataConnection, PeerConnectOption } from "peerjs";
+import { NativePeer } from "./nativeSignaling";
 
 /** Unambiguous characters -- no 0/O, 1/I/L confusion */
 const CODE_ALPHABET = "ABCDEFGHJKMNPQRSTUVWXYZ23456789";
@@ -204,14 +205,34 @@ export function connectionFailureSnapshot(conn: DataConnection): ConnectionFailu
 }
 
 /** Observe the public emitter before registration, including failed registration. */
-function createObservedPeer(side: "Host" | "Guest", config: RTCConfiguration, id?: string): Peer {
+function createObservedPeer(
+  side: "Host" | "Guest",
+  config: RTCConfiguration,
+  id?: string,
+  hostPeerId?: string,
+): Peer {
   const identity = {};
   let peerDiagnosticId = diagnosticIdFor(identity);
   const record = (event: "created" | "open" | "disconnected" | "close" | "timeout" | "error" | "constructor-error", error?: PeerDiagnosticError) => {
     recordDiagnostic({ kind: "signaling", peerDiagnosticId, observedAt: Date.now(), side, event, ...(error ? { error } : {}) });
   };
   let peer: Peer;
-  try { peer = id ? new Peer(id, { config }) : new Peer({ config }); }
+  try {
+    if (__SELF_HOSTED_SIGNALING__) {
+      const nativeId = id
+        ?? `phase2-client-${globalThis.crypto?.randomUUID?.() ?? Math.random().toString(36).slice(2)}`;
+      const native = new NativePeer({
+        id: nativeId,
+        role: side === "Host" ? "host" : "guest",
+        hostPeerId: hostPeerId ?? nativeId,
+        config,
+        signalingBaseUrl: __PEER_SIGNALING_URL__,
+      });
+      peer = native as unknown as Peer;
+    } else {
+      peer = id ? new Peer(id, { config }) : new Peer({ config });
+    }
+  }
   catch (error) { record("constructor-error", safePeerError(error)); throw error; }
   peerDiagnosticId = diagnosticIdFor(peer);
   record("created");
@@ -443,6 +464,16 @@ export interface HostRoomOptions {
 
 const UNAVAILABLE_ID_RETRY_BACKOFF_MS = [3_000, 3_000, 3_000];
 
+export function isRetriableHostRegistrationError(
+  allowUnavailableIdRetry: boolean,
+  peerErrorType: string | undefined,
+  selfHosted = __SELF_HOSTED_SIGNALING__,
+): boolean {
+  return allowUnavailableIdRetry
+    && (peerErrorType === "unavailable-id"
+      || (selfHosted && (peerErrorType === "network" || peerErrorType === "socket-closed")));
+}
+
 /**
  * Attempt to register a host Peer on the signaling server, retrying
  * on `unavailable-id` when `allowUnavailableIdRetry` is set. Each
@@ -470,7 +501,7 @@ async function openHostPeer(
   for (let attempt = 0; attempt < maxAttempts; attempt++) {
     if (signal?.aborted) throw new DOMException("Aborted", "AbortError");
 
-    const peer = createObservedPeer("Host", config, peerId);
+    const peer = createObservedPeer("Host", config, peerId, peerId);
     traceP2P("Host", "create-peer", { roomCode, peerId, attempt });
 
     try {
@@ -512,9 +543,7 @@ async function openHostPeer(
       return peer;
     } catch (err) {
       const peerErrorType = (err as { peerErrorType?: string }).peerErrorType;
-      const canRetry =
-        allowUnavailableIdRetry
-        && peerErrorType === "unavailable-id"
+      const canRetry = isRetriableHostRegistrationError(allowUnavailableIdRetry, peerErrorType)
         && attempt < UNAVAILABLE_ID_RETRY_BACKOFF_MS.length;
       if (!canRetry) throw err;
 
@@ -663,8 +692,8 @@ export async function joinRoom(
       reject(new DOMException("Aborted", "AbortError"));
       return;
     }
-    const peer = createObservedPeer("Guest", config);
     const peerId = PEER_ID_PREFIX + code;
+    const peer = createObservedPeer("Guest", config, undefined, peerId);
     let opened = false;
     traceP2P("Guest", "create-peer", { code, peerId });
 
