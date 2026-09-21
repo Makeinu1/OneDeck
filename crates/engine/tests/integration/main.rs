@@ -1120,6 +1120,7 @@ mod primo_unbounded_fractal_counters;
 mod printed_ability_order;
 mod printed_damage_prevention_survives_turn;
 mod proliferate_zero_counter;
+mod promise_of_loyalty;
 mod pulse_of_the_forge;
 mod punishing_punch_twice_subject_power;
 mod purged_source_attachment_count_lki;
@@ -1674,6 +1675,7 @@ mod yurlok_of_scorch_thrash;
 mod zenos_yae_galvus_chosen_object;
 mod zhulodok_double_cascade;
 
+mod arm_the_cathars_conjunct_anaphor_p6;
 mod context_ref_slot_hygiene;
 mod declared_target_damage_source;
 mod dismantle;
