@@ -81,6 +81,12 @@ Durable Object is deliberately a separate feasibility project because loading
 the full card corpus and native server dependencies into a 128 MiB Worker is a
 different architecture.
 
+Stage 2-A keeps that boundary explicit and provides a measurement-only probe
+for the existing engine-WASM build: see
+[`onedeck-cloudflare-stage2-a.md`](onedeck-cloudflare-stage2-a.md). A missing
+runtime artifact or a local pass is not deployment authorization; the later
+stage still requires a deployed Worker/DO measurement and real-player evidence.
+
 ## Acceptance evidence
 
 After a preview deployment, verify:
