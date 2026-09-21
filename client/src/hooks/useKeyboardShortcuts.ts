@@ -7,7 +7,7 @@ import {
 } from "../stores/gameStore";
 import { useUiStore } from "../stores/uiStore";
 import { dispatchAction } from "../game/dispatch";
-import { getPlayerId } from "./usePlayerId";
+import { getPlayerId, useCanActForWaitingState } from "./usePlayerId";
 import { useAltToggle } from "./useAltToggle";
 import { useShiftHeld } from "./useShiftHeld";
 import {
@@ -35,6 +35,7 @@ import {
 export function useKeyboardShortcuts(): void {
   useAltToggle();
   useShiftHeld();
+  const canActForWaitingState = useCanActForWaitingState();
 
   // Triple-tap gesture for debug panel on touch devices (no keyboard)
   useEffect(() => {
@@ -110,7 +111,7 @@ export function useKeyboardShortcuts(): void {
           break;
 
         case " ":
-          if (waitingFor?.type === "Priority") {
+          if (waitingFor?.type === "Priority" && canActForWaitingState) {
             e.preventDefault();
             dispatchAction({ type: "PassPriority" });
           }
@@ -235,5 +236,5 @@ export function useKeyboardShortcuts(): void {
     return () => {
       window.removeEventListener("keydown", handler);
     };
-  }, []);
+  }, [canActForWaitingState]);
 }
