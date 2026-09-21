@@ -107,7 +107,7 @@ jobs:
         env:
           PREVIEW_URL: ${{ steps.preview.outputs.url }}
         run: node scripts/onedeck-publish/verify_assets.mjs "$PREVIEW_URL" publication "$SOURCE_SHA"
-      - name: Exercise validated browser setup, first-player prompt, reload and game start
+      - name: Exercise validated browser setup, keep, stable game shell and reload
         env:
           PREVIEW_URL: ${{ steps.preview.outputs.url }}
         run: /tmp/onedeck-smoke/bin/python scripts/onedeck-publish/smoke_web.py "$PREVIEW_URL" "$SOURCE_SHA" --output publication-evidence/preview
