@@ -61,3 +61,17 @@ export function playerHandFanSizingStyle(totalCards: number): CSSProperties {
     "--hand-card-h": `calc(var(--hand-card-w) * ${HAND_CARD_HEIGHT_SCALE})`,
   } as CSSProperties;
 }
+
+/**
+ * Mulligan is a comparison surface rather than the normal battlefield hand.
+ * Fit every visible opening-hand card inside the mulligan panel's 72rem width
+ * budget so a standard seven-card hand is readable without horizontal scroll
+ * on ordinary desktop viewports.
+ */
+export function mulliganHandCardSizingStyle(handCount: number): CSSProperties {
+  const visibleCount = Math.max(1, handCount);
+  return {
+    "--card-w": `clamp(96px, calc((min(100vw, 72rem) - 6rem) / ${visibleCount}), 180px)`,
+    "--card-h": "calc(var(--card-w) * 1.4)",
+  } as CSSProperties;
+}
