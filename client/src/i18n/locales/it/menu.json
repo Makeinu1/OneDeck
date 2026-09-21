@@ -167,6 +167,7 @@
     "backToImport": "Torna all'importazione",
     "errorInvalidUrl": "Inserisci un URL di mazzo Moxfield o Archidekt valido.",
     "errorOffline": "Le importazioni da URL non sono disponibili offline. Usa Incolla testo o Da file.",
+    "errorUnavailable": "Le importazioni da URL non sono disponibili in questa distribuzione. Usa Incolla testo o Da file.",
     "errorNetworkFailure": "Impossibile raggiungere il servizio di importazione. Controlla la connessione e riprova.",
     "errorGeneric": "Importazione del mazzo non riuscita.",
     "errorNoOathbreaker": "Questo elenco non contiene un Oathbreaker valido.",

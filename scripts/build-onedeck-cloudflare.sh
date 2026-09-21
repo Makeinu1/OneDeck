@@ -209,7 +209,8 @@ fi
   export CARD_DATA_URL="$CARD_DATA_URL"
   export ENGINE_WASM_URL="$ENGINE_WASM_URL"
   export DRAFT_WASM_URL="$DRAFT_WASM_URL"
-  export VITE_IMPORT_DECK_URL="$WORKER_URL"
+  export ONEDECK_CLOUDFLARE_PROFILE="1"
+  export PEER_SIGNALING_URL="$WORKER_URL/signal"
   export OFFICIAL_MULTIPLAYER_SERVER_URL="$MULTIPLAYER_URL"
   export DEFAULT_MULTIPLAYER_SERVER_URL="$MULTIPLAYER_URL"
   export TURN_CREDENTIALS_URL="$TURN_CREDENTIALS_URL"
@@ -249,7 +250,7 @@ if [ -n "$forbidden" ]; then
   exit 1
 fi
 if rg -n --hidden -g '!*.map' \
-  'TURN_KEY_API_TOKEN|CLOUDFLARE_API_TOKEN|SUPABASE_SERVICE_ROLE|BEGIN (RSA|OPENSSH|EC) PRIVATE KEY|https://lobby\.phase-rs\.dev|https://phase-rs\.dev/turn-credentials' \
+  'TURN_KEY_API_TOKEN|CLOUDFLARE_API_TOKEN|SUPABASE_SERVICE_ROLE|BEGIN (RSA|OPENSSH|EC) PRIVATE KEY|https://lobby\.phase-rs\.dev|https://phase-rs\.dev/turn-credentials|0\.peerjs\.com' \
   client/dist >/dev/null; then
   echo "ERROR: a credential or official lobby/TURN endpoint marker was found in client/dist." >&2
   exit 1

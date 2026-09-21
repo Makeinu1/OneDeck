@@ -27,6 +27,7 @@ const ARCHIDEKT_HOST_RE = /^(?:www\.)?archidekt\.com$/;
 export const IMPORT_ERROR_KEYS = {
   invalidUrl: "importDeck.errorInvalidUrl",
   offline: "importDeck.errorOffline",
+  unavailable: "importDeck.errorUnavailable",
   networkFailure: "importDeck.errorNetworkFailure",
 } as const;
 
@@ -81,6 +82,12 @@ export async function fetchDeckFromUrl(input: string): Promise<string> {
   }
   if (getEffectiveOffline()) {
     throw new Error(IMPORT_ERROR_KEYS.offline);
+  }
+  // The OneDeck Cloudflare profile deliberately has no server-side deck
+  // importer. Fail before constructing a relative URL so a pasted private or
+  // public deck URL is never sent to the Pages origin as a fallback request.
+  if (!__URL_DECK_IMPORT_ENABLED__) {
+    throw new Error(IMPORT_ERROR_KEYS.unavailable);
   }
 
   const endpoint = `${IMPORT_DECK_BASE}/import-deck?url=${encodeURIComponent(normalized)}`;

@@ -6,7 +6,7 @@
 # never share that service's state or secrets.
 
 name = "onedeck-lobby"
-main = "src/index.ts"
+main = "src/onedeck.ts"
 compatibility_date = "2026-05-01"
 
 [build]
@@ -29,11 +29,19 @@ watch_dir = [
 name = "LOBBY"
 class_name = "LobbyDO"
 
+[[durable_objects.bindings]]
+name = "SIGNAL"
+class_name = "SignalDO"
+
 # A separate script gets a separate SQLite-backed namespace. The tag is kept
 # distinct so operators can tell this migration stream from phase-lobby's.
 [[migrations]]
 tag = "onedeck-v1"
 new_sqlite_classes = ["LobbyDO"]
+
+[[migrations]]
+tag = "onedeck-v2"
+new_sqlite_classes = ["SignalDO"]
 
 [vars]
 # TURN_KEY_ID and TURN_KEY_API_TOKEN are supplied by Cloudflare separately;

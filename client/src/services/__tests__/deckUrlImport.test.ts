@@ -72,6 +72,19 @@ describe("isSupportedDeckUrl", () => {
 // ---------------------------------------------------------------------------
 
 describe("fetchDeckFromUrl", () => {
+  it("fails closed without a network request when URL importing is disabled", async () => {
+    // The normal test define enables the generic importer. This assertion
+    // documents the production profile's fail-closed branch without sending
+    // a pasted URL to a relative Pages endpoint.
+    vi.stubGlobal("__URL_DECK_IMPORT_ENABLED__", false);
+    global.fetch = vi.fn();
+    await expect(fetchDeckFromUrl("https://moxfield.com/decks/abc")).rejects.toThrow(
+      IMPORT_ERROR_KEYS.unavailable,
+    );
+    expect(global.fetch).not.toHaveBeenCalled();
+    vi.stubGlobal("__URL_DECK_IMPORT_ENABLED__", true);
+  });
+
   it("calls /import-deck?url=... and returns the worker's decklist text", async () => {
     mockWorkerText("Name: Krenko\n[Commander]\n1 Krenko, Mob Boss\n[Main]\n1 Sol Ring\n");
     const text = await fetchDeckFromUrl("https://www.moxfield.com/decks/oEWXWHM5");

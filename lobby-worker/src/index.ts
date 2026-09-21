@@ -17,7 +17,7 @@ export { LobbyDO };
 // `TELEMETRY?` now lives on `LobbyDoEnv` — the DO reads it too, for the
 // server-probe mirror — and is inherited here, so the binding list has one
 // home. `handleTelemetry` is unchanged.
-interface Env extends TurnEnv, ImportDeckEnv, LobbyDoEnv {
+export interface Env extends TurnEnv, ImportDeckEnv, LobbyDoEnv {
   LOBBY: DurableObjectNamespace;
   // Per-IP rate limiters for the two directory write endpoints. Optional like
   // TELEMETRY: a deploy without the binding still serves, and the gate

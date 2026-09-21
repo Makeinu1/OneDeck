@@ -167,6 +167,7 @@
     "backToImport": "Back to import",
     "errorInvalidUrl": "Enter a valid Moxfield or Archidekt deck URL.",
     "errorOffline": "URL imports are unavailable offline. Use Paste Text or From File instead.",
+    "errorUnavailable": "URL imports are unavailable in this deployment. Use Paste Text or From File instead.",
     "errorNetworkFailure": "Couldn't reach the deck import service. Check your connection and try again.",
     "errorGeneric": "Failed to import deck.",
     "errorNoOathbreaker": "This list has no eligible Oathbreaker.",
