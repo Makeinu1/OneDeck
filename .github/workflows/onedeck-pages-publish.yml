@@ -3,7 +3,7 @@ name: OneDeck publish verified fork
 on:
   push:
     branches: [deploy/onedeck-play]
-    paths: ['.github/workflows/onedeck-pages-publish.yml']
+    paths:\n      - '.github/workflows/onedeck-pages-publish.yml'\n      - 'scripts/onedeck-publish/**'
 
 permissions:
   contents: read
