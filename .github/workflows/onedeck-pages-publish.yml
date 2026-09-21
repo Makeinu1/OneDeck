@@ -75,6 +75,8 @@ jobs:
           cp LICENSE-APACHE publication/licenses/phase-Apache-2.0.txt
           python scripts/onedeck-publish/pack_assets.py publication
           node --check publication/_worker.js
+          python -m py_compile scripts/onedeck-publish/smoke_web.py
+          node --check scripts/onedeck-publish/verify_assets.mjs
       - name: Install isolated browser validation tools without deployment credentials
         run: |
           python -m venv /tmp/onedeck-smoke
