@@ -91,10 +91,18 @@ with sync_playwright() as p:
         expect(keep).not_to_be_visible(timeout=120000)
         page.wait_for_timeout(3000)
         text = page.locator('body').inner_text()
-        assert re.search(r'Plains|Isamaru', text), 'Game board has no expected card identity'
+        # Card faces are rendered visually and their printed names are not
+        # guaranteed to participate in body.inner_text().  Validate the stable
+        # player-facing game shell instead: the game event, opening hand count,
+        # controls, and both Commander life totals must all be present after
+        # the Keep action has been accepted.
+        assert re.search(r'Game started', text, re.I), 'Game start event is not visible'
+        assert re.search(r'HAND\\s*7', text, re.I), 'Opening hand count is not visible'
+        assert re.search(r'CONTROL', text, re.I), 'Game control surface is not visible'
+        assert len(re.findall(r'(?<!\\d)40(?!\\d)', text)) >= 2, 'Both Commander life totals are not visible'
         assert not re.search(r'Engine connection lost|Failed to initialize|Unhandled error', text, re.I), 'Game error shown'
         page.screenshot(path=str(out / 'game-started.png'), full_page=True)
-        report['checks'].append('mulligan keep submitted through production UI and game board visible')
+        report['checks'].append('mulligan keep submitted and stable game shell visible')
         assert not report['page_errors'], 'Uncaught browser exceptions'
         response = page.goto(base + '/setup?format=Commander', wait_until='domcontentloaded', timeout=60000)
         assert response and response.ok
