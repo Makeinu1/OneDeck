@@ -15,51 +15,55 @@ jobs:
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
         with:
           node-version: 22
-      - name: Inspect immutable preview response bytes without credentials
+      - name: Compare failed real gateway with successful probe gateway
         run: |
           node --input-type=module <<'JS'
           import https from 'node:https';
           import { createHash } from 'node:crypto';
 
-          const url = 'https://d97af944.onedeck-play.pages.dev/assets/engine_wasm_bg-COcklXzW.wasm';
-          const expectedRaw = '5ea69f06350ab0dba5a52ca51d7263d1efb5c97cdfb3866aa97861c90748c5e6';
-          const expectedGzip = '8d2ac23bc5fb545008cfa5c47f2ae3de5f12af8fc055e75b69e4c4251f211b0f';
+          const urls = [
+            'https://fa386cf6.onedeck-play.pages.dev/assets/engine_wasm_bg-COcklXzW.wasm',
+            'https://fa386cf6.onedeck-play.pages.dev/.encoded/5ea69f06350ab0dba5a52ca51d7263d1efb5c97cdfb3866aa97861c90748c5e6.gz',
+            'https://fa386cf6.onedeck-play.pages.dev/card-data-e91442d3bafed2b9.json',
+            'https://fa386cf6.onedeck-play.pages.dev/.encoded/e91442d3bafed2b99474f6d421d3fa4d56e1d43ba0056b186946b7e2dded59e9.gz',
+            'https://onedeck-asset-check.onedeck-play.pages.dev/probe.wasm',
+          ];
 
-          function rawGet(acceptEncoding) {
+          function rawGet(url) {
             return new Promise((resolve, reject) => {
-              https.get(url, { headers: {'Accept-Encoding': acceptEncoding}}, r => {
+              https.get(url, { headers: {'Accept-Encoding': 'identity'}}, r => {
                 const chunks = [];
                 r.on('data', c => chunks.push(c));
                 r.on('end', () => {
                   const body = Buffer.concat(chunks);
                   resolve({
+                    url,
                     status: r.statusCode,
-                    headers: r.headers,
+                    contentType: r.headers['content-type'] ?? null,
+                    contentEncoding: r.headers['content-encoding'] ?? null,
                     bytes: body.length,
                     sha256: createHash('sha256').update(body).digest('hex'),
-                    first8: body.subarray(0, 8).toString('hex'),
+                    first8: body.subarray(0,8).toString('hex'),
+                    preview: body.subarray(0,80).toString('utf8').replace(/\s+/g,' '),
                   });
                 });
               }).on('error', reject);
             });
           }
 
-          for (const enc of ['identity', 'gzip']) {
-            const r = await rawGet(enc);
-            console.log('HTTPS', enc, JSON.stringify(r));
-          }
+          for (const url of urls) console.log('RAW', JSON.stringify(await rawGet(url)));
 
-          const f = await fetch(url, {cache: 'no-store'});
-          const body = Buffer.from(await f.arrayBuffer());
-          console.log('FETCH', JSON.stringify({
-            status: f.status,
-            contentType: f.headers.get('content-type'),
-            contentEncoding: f.headers.get('content-encoding'),
-            contentLength: f.headers.get('content-length'),
-            bytes: body.length,
-            sha256: createHash('sha256').update(body).digest('hex'),
-            first8: body.subarray(0,8).toString('hex'),
-            expectedRaw,
-            expectedGzip,
-          }));
+          for (const url of [urls[0], urls[2], urls[4]]) {
+            const r = await fetch(url, {cache:'no-store'});
+            const body = Buffer.from(await r.arrayBuffer());
+            console.log('FETCH', JSON.stringify({
+              url,
+              status:r.status,
+              contentType:r.headers.get('content-type'),
+              contentEncoding:r.headers.get('content-encoding'),
+              bytes:body.length,
+              sha256:createHash('sha256').update(body).digest('hex'),
+              first8:body.subarray(0,8).toString('hex'),
+            }));
+          }
           JS
