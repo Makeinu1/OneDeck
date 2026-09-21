@@ -10,7 +10,20 @@
 
 type PeerEvent = "open" | "connection" | "close" | "disconnected" | "error";
 type ConnectionEvent = "open" | "data" | "close" | "error";
-type Handler = (...args: any[]) => void;
+type EventHandler = (...args: never[]) => void;
+type ConnectionEventArgs = {
+  open: [];
+  data: [data: unknown];
+  close: [];
+  error: [error: Error & { type?: string }];
+};
+type PeerEventArgs = {
+  open: [id: string];
+  connection: [connection: NativeDataConnection];
+  close: [];
+  disconnected: [id: string];
+  error: [error: Error & { type?: string }];
+};
 
 // PeerJS BinaryPack splits binary messages into <=16,300 byte SCTP frames.
 // Keep the native transport's wire contract independent of the browser's
@@ -73,8 +86,10 @@ function signalUrl(baseUrl: string, hostPeerId: string, peerId: string, role: Na
   return url.toString();
 }
 
-function emit(map: Map<string, Set<Handler>>, event: string, ...args: any[]): void {
-  for (const handler of [...(map.get(event) ?? [])]) handler(...args);
+function emit(map: Map<string, Set<EventHandler>>, event: string, ...args: unknown[]): void {
+  for (const handler of [...(map.get(event) ?? [])]) {
+    (handler as (...values: unknown[]) => void)(...args);
+  }
 }
 
 export class NativeDataConnection {
@@ -87,7 +102,7 @@ export class NativeDataConnection {
   dataChannel: RTCDataChannel | null = null;
   open = false;
 
-  private readonly handlers = new Map<string, Set<Handler>>();
+  private readonly handlers = new Map<string, Set<EventHandler>>();
   private closed = false;
   private pendingCandidates: RTCIceCandidateInit[] = [];
   private remoteDescriptionReady = false;
@@ -104,27 +119,27 @@ export class NativeDataConnection {
     });
   }
 
-  on(event: ConnectionEvent, handler: Handler): this {
-    const set = this.handlers.get(event) ?? new Set<Handler>();
-    set.add(handler);
+  on<E extends ConnectionEvent>(event: E, handler: (...args: ConnectionEventArgs[E]) => void): this {
+    const set = this.handlers.get(event) ?? new Set<EventHandler>();
+    set.add(handler as EventHandler);
     this.handlers.set(event, set);
     return this;
   }
 
-  once(event: ConnectionEvent, handler: Handler): this {
-    const once = (...args: any[]) => {
+  once<E extends ConnectionEvent>(event: E, handler: (...args: ConnectionEventArgs[E]) => void): this {
+    const once = (...args: ConnectionEventArgs[E]) => {
       this.off(event, once);
       handler(...args);
     };
     return this.on(event, once);
   }
 
-  off(event: ConnectionEvent, handler: Handler): this {
-    this.handlers.get(event)?.delete(handler);
+  off<E extends ConnectionEvent>(event: E, handler: (...args: ConnectionEventArgs[E]) => void): this {
+    this.handlers.get(event)?.delete(handler as EventHandler);
     return this;
   }
 
-  private dispatch(event: ConnectionEvent, ...args: any[]): void {
+  private dispatch<E extends ConnectionEvent>(event: E, ...args: ConnectionEventArgs[E]): void {
     emit(this.handlers, event, ...args);
   }
 
@@ -274,7 +289,7 @@ export class NativePeer {
   disconnected = true;
   destroyed = false;
 
-  private readonly handlers = new Map<string, Set<Handler>>();
+  private readonly handlers = new Map<string, Set<EventHandler>>();
   private readonly connections = new Map<string, NativeDataConnection>();
   private readonly hostPeerId: string;
   private readonly signalingBaseUrl: string;
@@ -292,27 +307,27 @@ export class NativePeer {
     this.startSignaling();
   }
 
-  on(event: PeerEvent, handler: Handler): this {
-    const set = this.handlers.get(event) ?? new Set<Handler>();
-    set.add(handler);
+  on<E extends PeerEvent>(event: E, handler: (...args: PeerEventArgs[E]) => void): this {
+    const set = this.handlers.get(event) ?? new Set<EventHandler>();
+    set.add(handler as EventHandler);
     this.handlers.set(event, set);
     return this;
   }
 
-  once(event: PeerEvent, handler: Handler): this {
-    const once = (...args: any[]) => {
+  once<E extends PeerEvent>(event: E, handler: (...args: PeerEventArgs[E]) => void): this {
+    const once = (...args: PeerEventArgs[E]) => {
       this.off(event, once);
       handler(...args);
     };
     return this.on(event, once);
   }
 
-  off(event: PeerEvent, handler: Handler): this {
-    this.handlers.get(event)?.delete(handler);
+  off<E extends PeerEvent>(event: E, handler: (...args: PeerEventArgs[E]) => void): this {
+    this.handlers.get(event)?.delete(handler as EventHandler);
     return this;
   }
 
-  private dispatch(event: PeerEvent, ...args: any[]): void {
+  private dispatch<E extends PeerEvent>(event: E, ...args: PeerEventArgs[E]): void {
     emit(this.handlers, event, ...args);
   }
 
@@ -343,7 +358,7 @@ export class NativePeer {
         socket = new WebSocket(signalUrl(this.signalingBaseUrl, this.hostPeerId, this.id, this.role));
       } catch (error) {
         reject(error);
-        this.dispatch("error", error);
+        this.dispatch("error", error instanceof Error ? error : new Error(String(error)));
         this.openPromise = null;
         return;
       }
