@@ -112,7 +112,7 @@ export function useKeyboardShortcuts(): void {
         case " ":
           if (waitingFor?.type === "Priority") {
             e.preventDefault();
-            dispatch({ type: "PassPriority" });
+            dispatchAction({ type: "PassPriority" });
           }
           break;
 
