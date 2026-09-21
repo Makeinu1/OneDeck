@@ -97,9 +97,9 @@ with sync_playwright() as p:
         # controls, and both Commander life totals must all be present after
         # the Keep action has been accepted.
         assert re.search(r'Game started', text, re.I), 'Game start event is not visible'
-        assert re.search(r'HAND\\s*7', text, re.I), 'Opening hand count is not visible'
+        assert re.search(r'HAND\s*7', text, re.I), 'Opening hand count is not visible'
         assert re.search(r'CONTROL', text, re.I), 'Game control surface is not visible'
-        assert len(re.findall(r'(?<!\\d)40(?!\\d)', text)) >= 2, 'Both Commander life totals are not visible'
+        assert len(re.findall(r'(?<!\d)40(?!\d)', text)) >= 2, 'Both Commander life totals are not visible'
         assert not re.search(r'Engine connection lost|Failed to initialize|Unhandled error', text, re.I), 'Game error shown'
         page.screenshot(path=str(out / 'game-started.png'), full_page=True)
         report['checks'].append('mulligan keep submitted and stable game shell visible')
