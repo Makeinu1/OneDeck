@@ -66,6 +66,24 @@ with sync_playwright() as p:
         start.click()
         page.wait_for_url(re.compile(r'/game/'), timeout=120000)
         keep = page.get_by_role('button', name=re.compile(r'^Keep', re.I)).first
+
+        # Current game flow reveals the first-player roll before mulligan.
+        # Older builds could go directly to Keep, so handle the reveal only
+        # when present instead of making either ordering a publication rule.
+        if not keep.is_visible():
+            reveal = page.get_by_text(re.compile(r'TAP TO CONTINUE', re.I)).first
+            reveal_deadline = time.monotonic() + 30
+            advanced_reveal = False
+            while time.monotonic() < reveal_deadline and not keep.is_visible():
+                if reveal.count() and reveal.is_visible():
+                    reveal.click(timeout=5000)
+                    advanced_reveal = True
+                    page.wait_for_timeout(750)
+                else:
+                    page.wait_for_timeout(500)
+            if advanced_reveal:
+                report['checks'].append('first-player reveal advanced through the production UI')
+
         expect(keep).to_be_visible(timeout=180000)
         page.screenshot(path=str(out / 'opening-hand.png'), full_page=True)
         report['checks'].append('real WASM game initialized and opening hand offered')
