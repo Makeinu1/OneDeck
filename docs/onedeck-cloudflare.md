@@ -34,13 +34,17 @@ TURN token is shared.
 
 The Worker CORS allowlist is injected from `pages_origin`; the checked-in
 `https://onedeck-play.pages.dev` value is only a safe default for a newly created
-project. Do not replace it with `*` in a production deployment.
+project. The workflow accepts only an HTTPS origin (scheme, host, and optional
+port), normalizes it before both deployments, and rejects paths, queries,
+fragments, userinfo, whitespace, and a trailing slash. Do not replace it with
+`*` in a production deployment.
 
 This Stage 1 profile is intended for a personal or trusted-user deployment.
-`/turn-credentials` uses the exact Pages-origin CORS allowlist, but CORS is not
-an authentication or abuse-prevention boundary. Monitor TURN usage and add a
-rate-limit/authentication layer before opening the Worker to an untrusted public
-audience.
+`/turn-credentials` uses the exact Pages-origin CORS allowlist and a per-IP
+Cloudflare rate limit, but CORS and IP throttling are not authentication. This
+profile therefore remains intended for a personal or trusted-user deployment;
+add an authenticated session boundary before opening the Worker to an untrusted
+public audience.
 
 ## Build boundary
 

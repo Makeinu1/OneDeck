@@ -48,6 +48,9 @@ jobs:
         with:
           node-version: 22
 
+      - name: Normalize Pages origin
+        run: echo "ONEDECK_PAGES_ORIGIN=$(node scripts/normalize-web-origin.mjs "$ONEDECK_PAGES_ORIGIN")" >> "$GITHUB_ENV"
+
       - name: Install Worker dependencies
         run: npm ci --prefix lobby-worker
 
@@ -76,7 +79,6 @@ jobs:
           test -n "$CLOUDFLARE_ACCOUNT_ID" || { echo "CLOUDFLARE_ACCOUNT_ID is required" >&2; exit 1; }
           test -n "$ONEDECK_TURN_KEY_ID" || { echo "ONEDECK_TURN_KEY_ID is required" >&2; exit 1; }
           test -n "$ONEDECK_TURN_API_TOKEN" || { echo "ONEDECK_TURN_API_TOKEN is required" >&2; exit 1; }
-          case "$ONEDECK_PAGES_ORIGIN" in https://*) ;; *) echo "pages_origin must be an https origin" >&2; exit 1 ;; esac
 
       - name: Install the dedicated TURN API secret
         working-directory: lobby-worker
@@ -127,6 +129,9 @@ jobs:
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
         with:
           node-version: 22
+
+      - name: Normalize Pages origin
+        run: echo "ONEDECK_PAGES_ORIGIN=$(node scripts/normalize-web-origin.mjs "$ONEDECK_PAGES_ORIGIN")" >> "$GITHUB_ENV"
 
       - uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 # v1.17.0
         with:

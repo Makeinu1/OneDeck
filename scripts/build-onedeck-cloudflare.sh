@@ -26,15 +26,14 @@ cd "$(dirname "${BASH_SOURCE[0]}")/.."
 
 R2_PUBLIC_URL="${ONEDECK_R2_PUBLIC_URL%/}"
 WORKER_URL="${ONEDECK_WORKER_URL%/}"
-PAGES_ORIGIN="${ONEDECK_PAGES_ORIGIN%/}"
+PAGES_ORIGIN="$(node scripts/normalize-web-origin.mjs "$ONEDECK_PAGES_ORIGIN")" || {
+  echo "ERROR: ONEDECK_PAGES_ORIGIN must be an https origin without a path, query, fragment, userinfo, or trailing slash" >&2
+  exit 2
+}
 UPLOAD_R2="${ONEDECK_UPLOAD_R2:-0}"
 VERIFY_R2="${ONEDECK_VERIFY_R2:-0}"
 STAGING_DIR="${ONEDECK_R2_STAGING_DIR:-}"
 
-case "$PAGES_ORIGIN" in
-  https://*) ;;
-  *) echo "ERROR: ONEDECK_PAGES_ORIGIN must be an https origin" >&2; exit 2 ;;
-esac
 case "$WORKER_URL" in
   https://*) ;;
   *) echo "ERROR: ONEDECK_WORKER_URL must be an https URL" >&2; exit 2 ;;

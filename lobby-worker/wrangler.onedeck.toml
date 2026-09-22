@@ -29,6 +29,11 @@ watch_dir = [
 name = "LOBBY"
 class_name = "LobbyDO"
 
+[[ratelimits]]
+name = "TURN_LIMIT"
+namespace_id = "1005"
+simple = { limit = 60, period = 60 }
+
 # A separate script gets a separate SQLite-backed namespace. The tag is kept
 # distinct so operators can tell this migration stream from phase-lobby's.
 [[migrations]]
