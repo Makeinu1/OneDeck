@@ -51,8 +51,11 @@ jobs:
       - name: Validate and normalize Pages origin
         id: normalize-pages-origin
         run: |
-          printf 'origin=%s\n' "$(node scripts/validate-onedeck-origin.mjs "$ONEDECK_PAGES_ORIGIN")" \
-            >> "$GITHUB_OUTPUT"
+          if ! canonical_origin="$(node scripts/validate-onedeck-origin.mjs "$ONEDECK_PAGES_ORIGIN")"; then
+            echo "pages_origin failed validation" >&2
+            exit 1
+          fi
+          printf 'origin=%s\n' "$canonical_origin" >> "$GITHUB_OUTPUT"
 
       - name: Install Worker dependencies
         run: npm ci --prefix lobby-worker
