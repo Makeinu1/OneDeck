@@ -49,7 +49,9 @@ jobs:
           node-version: 22
 
       - name: Normalize Pages origin
-        run: echo "ONEDECK_PAGES_ORIGIN=$(node scripts/normalize-web-origin.mjs "$ONEDECK_PAGES_ORIGIN")" >> "$GITHUB_ENV"
+        run: |
+          normalized_origin="$(node scripts/normalize-web-origin.mjs "$ONEDECK_PAGES_ORIGIN")"
+          echo "ONEDECK_PAGES_ORIGIN=$normalized_origin" >> "$GITHUB_ENV"
 
       - name: Install Worker dependencies
         run: npm ci --prefix lobby-worker
@@ -131,7 +133,9 @@ jobs:
           node-version: 22
 
       - name: Normalize Pages origin
-        run: echo "ONEDECK_PAGES_ORIGIN=$(node scripts/normalize-web-origin.mjs "$ONEDECK_PAGES_ORIGIN")" >> "$GITHUB_ENV"
+        run: |
+          normalized_origin="$(node scripts/normalize-web-origin.mjs "$ONEDECK_PAGES_ORIGIN")"
+          echo "ONEDECK_PAGES_ORIGIN=$normalized_origin" >> "$GITHUB_ENV"
 
       - uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 # v1.17.0
         with:
