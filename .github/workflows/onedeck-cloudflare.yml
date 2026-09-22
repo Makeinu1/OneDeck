@@ -102,10 +102,11 @@ jobs:
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
           CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
           ONEDECK_TURN_KEY_ID: ${{ secrets.ONEDECK_TURN_KEY_ID }}
+          CANONICAL_PAGES_ORIGIN: ${{ steps.normalize-pages-origin.outputs.origin }}
         run: |
           npx wrangler deploy --config wrangler.onedeck.toml \
             --var "TURN_KEY_ID:$ONEDECK_TURN_KEY_ID" \
-            --var "ALLOWED_ORIGINS:${{ steps.normalize-pages-origin.outputs.origin }}"
+            --var "ALLOWED_ORIGINS:$CANONICAL_PAGES_ORIGIN"
 
   deploy-pages:
     name: Build and deploy OneDeck Pages
