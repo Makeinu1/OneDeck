@@ -114,7 +114,7 @@ jobs:
       ONEDECK_WORKER_URL: ${{ inputs.worker_url }}
       ONEDECK_PAGES_ORIGIN: ${{ inputs.pages_origin }}
       ONEDECK_PAGES_PROJECT: ${{ inputs.pages_project }}
-      ONEDECK_R2_STAGING_DIR: ${{ runner.temp }}/onedeck-r2
+      ONEDECK_R2_STAGING_DIR: ${{ github.workspace }}/.onedeck-r2
       ONEDECK_GENERATE_DATA: "1"
       ONEDECK_RUN_SEMANTIC_AUDIT: "1"
       ONEDECK_UPLOAD_R2: "0"
