@@ -81,6 +81,28 @@ test("returns 429 and does not call the TURN API when the limiter refuses", asyn
   assert.equal(upstreamCalls, 0);
 });
 
+test("returns 503 and does not call the TURN API when the limiter fails", async () => {
+  let upstreamCalls = 0;
+  globalThis.fetch = async () => {
+    upstreamCalls += 1;
+    throw new Error("the upstream must not be reached");
+  };
+
+  const response = await handleTurnCredentials(
+    turnRequest(),
+    configuredEnv({
+      async limit() {
+        throw new Error("rate limiter unavailable");
+      },
+    }),
+  );
+
+  assert.equal(response.status, 503);
+  assert.equal(response.headers.get("Access-Control-Allow-Origin"), "https://onedeck-play.pages.dev");
+  assert.deepEqual(await response.json(), { error: "TURN rate limiter unavailable" });
+  assert.equal(upstreamCalls, 0);
+});
+
 test("OPTIONS does not spend a limiter budget or call the TURN API", async () => {
   let limiterCalls = 0;
   let upstreamCalls = 0;
