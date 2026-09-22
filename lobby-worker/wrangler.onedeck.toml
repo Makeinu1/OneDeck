@@ -33,6 +33,14 @@ class_name = "LobbyDO"
 name = "SIGNAL"
 class_name = "SignalDO"
 
+# Per-IP throttle for short-lived TURN credential minting. The namespace id is
+# developer-chosen (not a provisioned resource); keep it distinct from the
+# official phase-lobby bindings. This is an abuse throttle, not authentication.
+[[ratelimits]]
+name = "TURN_LIMIT"
+namespace_id = "1005"
+simple = { limit = 30, period = 60 }
+
 # A separate script gets a separate SQLite-backed namespace. The tag is kept
 # distinct so operators can tell this migration stream from phase-lobby's.
 [[migrations]]

@@ -48,6 +48,15 @@ jobs:
         with:
           node-version: 22
 
+      - name: Validate and normalize Pages origin
+        id: normalize-pages-origin
+        run: |
+          if ! canonical_origin="$(node scripts/validate-onedeck-origin.mjs "$ONEDECK_PAGES_ORIGIN")"; then
+            echo "pages_origin failed validation" >&2
+            exit 1
+          fi
+          printf 'origin=%s\n' "$canonical_origin" >> "$GITHUB_OUTPUT"
+
       - name: Install Worker dependencies
         run: npm ci --prefix lobby-worker
 
@@ -76,7 +85,6 @@ jobs:
           test -n "$CLOUDFLARE_ACCOUNT_ID" || { echo "CLOUDFLARE_ACCOUNT_ID is required" >&2; exit 1; }
           test -n "$ONEDECK_TURN_KEY_ID" || { echo "ONEDECK_TURN_KEY_ID is required" >&2; exit 1; }
           test -n "$ONEDECK_TURN_API_TOKEN" || { echo "ONEDECK_TURN_API_TOKEN is required" >&2; exit 1; }
-          case "$ONEDECK_PAGES_ORIGIN" in https://*) ;; *) echo "pages_origin must be an https origin" >&2; exit 1 ;; esac
 
       - name: Install the dedicated TURN API secret
         working-directory: lobby-worker
@@ -94,10 +102,11 @@ jobs:
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
           CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
           ONEDECK_TURN_KEY_ID: ${{ secrets.ONEDECK_TURN_KEY_ID }}
+          CANONICAL_PAGES_ORIGIN: ${{ steps.normalize-pages-origin.outputs.origin }}
         run: |
           npx wrangler deploy --config wrangler.onedeck.toml \
             --var "TURN_KEY_ID:$ONEDECK_TURN_KEY_ID" \
-            --var "ALLOWED_ORIGINS:$ONEDECK_PAGES_ORIGIN"
+            --var "ALLOWED_ORIGINS:$CANONICAL_PAGES_ORIGIN"
 
   deploy-pages:
     name: Build and deploy OneDeck Pages
