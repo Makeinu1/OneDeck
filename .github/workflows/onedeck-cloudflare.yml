@@ -33,7 +33,9 @@ permissions:
   contents: read
 
 jobs:
+  # Deployment credentials are reachable only from the protected default branch.
   deploy-worker:
+    if: github.ref == 'refs/heads/main'
     name: Deploy isolated OneDeck Worker
     runs-on: ubuntu-latest
     timeout-minutes: 25
@@ -104,6 +106,7 @@ jobs:
             --var "ALLOWED_ORIGINS:$ONEDECK_PAGES_ORIGIN"
 
   deploy-pages:
+    if: github.ref == 'refs/heads/main'
     name: Build and deploy OneDeck Pages
     needs: [deploy-worker]
     runs-on: ubuntu-latest
