@@ -35,15 +35,23 @@ clients can forge an `Origin` header.
    URL, and R2 bucket. The workflow deploys the Worker first, then builds and
    deploys Pages.
 
+The checked-in Worker profile binds `TURN_LIMIT` as a per-IP, 30-per-minute
+Cloudflare Rate Limiting throttle before it calls the Realtime TURN API. Its
+namespace id is an operator-chosen binding identifier, not a secret or a
+separately provisioned database. If you copy this profile into another
+Cloudflare account, keep the binding and choose a namespace id that is not
+shared with an unrelated application.
+
 The Worker CORS allowlist is injected from `pages_origin`; the checked-in
 `https://onedeck-play.pages.dev` value is only a safe default for a newly created
 project. Do not replace it with `*` in a production deployment.
 
 This Stage 1 profile is intended for a personal or trusted-user deployment.
-`/turn-credentials` uses the exact Pages-origin CORS allowlist, but CORS is not
-an authentication or abuse-prevention boundary. Monitor TURN usage and add a
-rate-limit/authentication layer before opening the Worker to an untrusted public
-audience.
+`/turn-credentials` uses the exact Pages-origin CORS allowlist and the
+`TURN_LIMIT` throttle, but neither CORS nor Rate Limiting is authentication:
+non-browser callers can forge `Origin`, and Rate Limiting is location-scoped
+and eventually consistent. Monitor TURN usage and add authentication and
+authorization before opening the Worker to an untrusted public audience.
 
 ## Build boundary
 
