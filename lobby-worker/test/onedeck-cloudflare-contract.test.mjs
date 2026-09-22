@@ -25,6 +25,12 @@ test("keeps the normalized Pages origin connected to the deploy boundary", () =>
   const buildScript = readRepoFile("scripts/build-onedeck-cloudflare.sh");
 
   assert.match(workflow, /id: normalize-pages-origin/);
+  assert.equal(
+    workflow.includes(
+      'canonical_origin="$(node scripts/validate-onedeck-origin.mjs "$ONEDECK_PAGES_ORIGIN")"',
+    ),
+    true,
+  );
   assert.match(workflow, /printf 'origin=%s\\n' "\$canonical_origin" >> "\$GITHUB_OUTPUT"/);
   assert.match(workflow, /CANONICAL_PAGES_ORIGIN: \$\{\{ steps\.normalize-pages-origin\.outputs\.origin \}\}/);
   assert.match(workflow, /--var "ALLOWED_ORIGINS:\$CANONICAL_PAGES_ORIGIN"/);
