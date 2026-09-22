@@ -27,10 +27,11 @@ TURN token is shared.
 3. Create a Cloudflare Realtime TURN key dedicated to OneDeck. Add these GitHub
    Actions secrets: `CLOUDFLARE_API_TOKEN`, `CLOUDFLARE_ACCOUNT_ID`,
    `ONEDECK_TURN_KEY_ID`, and `ONEDECK_TURN_API_TOKEN`.
-4. Run **Deploy OneDeck Cloudflare profile** manually from the exact commit you
-   want to publish. Supply the Pages project/origin, Worker HTTPS URL, R2 public
-   URL, and R2 bucket. The workflow deploys the Worker first, then builds and
-   deploys Pages.
+4. Run **Deploy OneDeck Cloudflare profile** manually from the protected
+   `main` branch. The workflow fails closed on other refs because it handles
+   Cloudflare credentials and executes repository-controlled build code. Supply
+   the Pages project/origin, Worker HTTPS URL, R2 public URL, and R2 bucket. The
+   workflow deploys the Worker first, then builds and deploys Pages.
 
 The Worker CORS allowlist is injected from `pages_origin`; the checked-in
 `https://onedeck-play.pages.dev` value is only a safe default for a newly created
