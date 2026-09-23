@@ -2401,14 +2401,6 @@ struct ViewerSnapshot<'a> {
     events: Option<Vec<GameEvent>>,
 }
 
-fn filter_transition_events_for_viewer(
-    events: &[GameEvent],
-    state: &GameState,
-    viewer: PlayerId,
-) -> Vec<GameEvent> {
-    filter_events_for_viewer(events, state, viewer)
-}
-
 fn legal_actions_result_for_viewer(state: &GameState, viewer: PlayerId) -> LegalActionsResult {
     let (actions, spell_costs, legal_actions_by_object) = legal_actions_for_viewer(state, viewer);
     let auto_pass_recommended = auto_pass_recommended_for_viewer(state, viewer, &actions);
@@ -2497,8 +2489,8 @@ mod viewer_priority_tests {
     }
 
     #[test]
-    fn transition_projection_uses_engine_event_visibility_authority() {
-        let state = GameState::new_two_player(42);
+    fn production_transition_snapshot_filters_events_for_each_viewer() {
+        let mut state = GameState::new_two_player(42);
         let event = GameEvent::CardDrawn {
             player_id: PlayerId(0),
             object_id: ObjectId(99),
@@ -2506,12 +2498,13 @@ mod viewer_priority_tests {
             nth_in_step: 1,
         };
 
-        assert!(
-            filter_transition_events_for_viewer(&[event.clone()], &state, PlayerId(1)).is_empty()
-        );
+        let opponent = viewer_transition_snapshot(&mut state, PlayerId(1), vec![event.clone()]);
+        assert_eq!(opponent["events"], serde_json::json!([]));
+
+        let owner = viewer_transition_snapshot(&mut state, PlayerId(0), vec![event.clone()]);
         assert_eq!(
-            filter_transition_events_for_viewer(&[event.clone()], &state, PlayerId(0)),
-            vec![event]
+            owner["events"],
+            serde_json::to_value(vec![event]).expect("event serializes")
         );
     }
 }
@@ -2548,6 +2541,41 @@ pub fn get_viewer_snapshot_js(player_id: u32) -> JsValue {
     }
 }
 
+/// Build the combined viewer-scoped transition projection used by browser-host
+/// P2P. This is kept as the production builder so its native regression covers
+/// the same state/event seam as the exported WASM function without requiring a
+/// second test-only visibility path.
+fn viewer_transition_snapshot(
+    state: &mut GameState,
+    viewer: PlayerId,
+    events: Vec<GameEvent>,
+) -> serde_json::Value {
+    engine::game::layers::flush_layers(state);
+    let filtered = filter_state_for_viewer(state, viewer);
+    let legal = legal_actions_result_for_viewer(state, viewer);
+    let viewer_interaction =
+        engine::game::interaction::derive_viewer_interaction(state, &filtered, viewer);
+    let filtered_events = filter_events_for_viewer(&events, state, viewer);
+    serde_json::to_value(ViewerSnapshot {
+        state: engine::game::derived_views::ClientGameStateRef::wrap_filtered(
+            state,
+            &filtered,
+            Some(viewer),
+        ),
+        actions: legal.actions,
+        auto_pass_recommended: legal.auto_pass_recommended,
+        end_continuous_effect_offers: legal.end_continuous_effect_offers,
+        mana_payment_shortcut_actions: legal.mana_payment_shortcut_actions,
+        spell_costs: legal.spell_costs,
+        legal_actions_by_object: legal.legal_actions_by_object,
+        activation_block_reasons: legal.activation_block_reasons,
+        stuck_diagnostic: legal.stuck_diagnostic,
+        viewer_interaction,
+        events: Some(filtered_events),
+    })
+    .expect("viewer transition snapshot serializes")
+}
+
 /// Combined viewer-scoped transition projection used by browser-host P2P.
 ///
 /// State, legal actions, interaction authority, and transition events are
@@ -2561,30 +2589,8 @@ pub fn get_viewer_transition_snapshot_js(player_id: u32, events: JsValue) -> JsV
         Err(_) => return JsValue::NULL,
     };
     match with_state_mut(|state| {
-        engine::game::layers::flush_layers(state);
         let viewer = PlayerId(player_id as u8);
-        let filtered = filter_state_for_viewer(state, viewer);
-        let legal = legal_actions_result_for_viewer(state, viewer);
-        let viewer_interaction =
-            engine::game::interaction::derive_viewer_interaction(state, &filtered, viewer);
-        let filtered_events = filter_transition_events_for_viewer(&events, state, viewer);
-        to_js(&ViewerSnapshot {
-            state: engine::game::derived_views::ClientGameStateRef::wrap_filtered(
-                state,
-                &filtered,
-                Some(viewer),
-            ),
-            actions: legal.actions,
-            auto_pass_recommended: legal.auto_pass_recommended,
-            end_continuous_effect_offers: legal.end_continuous_effect_offers,
-            mana_payment_shortcut_actions: legal.mana_payment_shortcut_actions,
-            spell_costs: legal.spell_costs,
-            legal_actions_by_object: legal.legal_actions_by_object,
-            activation_block_reasons: legal.activation_block_reasons,
-            stuck_diagnostic: legal.stuck_diagnostic,
-            viewer_interaction,
-            events: Some(filtered_events),
-        })
+        to_js(&viewer_transition_snapshot(state, viewer, events))
     }) {
         Ok(val) => val,
         Err(_) => JsValue::NULL,
