@@ -8177,30 +8177,14 @@ pub(super) fn parse_followup_continuation_ast(
             origin: Some(Zone::Library),
             destination: Zone::Exile,
             ..
-        } if matches!(
-            lower.trim(),
-            "exile it face down"
-                | "exile that card face down"
-                | "exile the card face down"
-                | "exile them face down"
-                | "exile those cards face down"
-        ) =>
-        {
+        } if parse_exile_looked_at_card(&lower) == Some(true) => {
             Some(ContinuationAst::ExileSearchResultFaceDown)
         }
         Effect::ChangeZone {
             origin: Some(Zone::Library),
             destination: Zone::Exile,
             ..
-        } if matches!(
-            lower.trim(),
-            "exile it"
-                | "exile that card"
-                | "exile the card"
-                | "exile them"
-                | "exile those cards"
-        ) =>
-        {
+        } if parse_exile_looked_at_card(&lower) == Some(false) => {
             Some(ContinuationAst::SearchResultClauseHandled)
         }
         Effect::ChangeZone {

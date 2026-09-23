@@ -16,7 +16,7 @@ use crate::types::game_state::{
     PendingPlayerScopeSacrificeCompletion, PersistentAxisMaterialization, WaitingFor,
     ZoneOpponentChooserPurpose,
 };
-use crate::types::identifiers::{ObjectId, TrackedSetId};
+use crate::types::identifiers::{ObjectId, ObjectIncarnationRef, TrackedSetId};
 use crate::types::resolved_commands::{
     ResolvedInformationAudience, ResolvedInformationEdit, ResolvedInformationLifetime,
 };
@@ -1158,6 +1158,44 @@ fn continuation_exiles_found_set(chain: &ResolvedAbility) -> bool {
     false
 }
 
+/// CR 701.23a + CR 400.7: Carry the latched audience for a hidden search into
+/// the action result that applies the player's selection. SearchChoice and its
+/// resulting zone changes are allowed to be separate wire batches, so the
+/// original HiddenSearchViewed event cannot be the sole visibility authority.
+/// Re-emitting only the selected exact incarnations keeps the authority
+/// engine-owned and lets the shared event filter distinguish a searcher from a
+/// card owner in asymmetric searches (for example, Praetor's Grasp).
+fn emit_selected_search_visibility(
+    state: &GameState,
+    player: crate::types::player::PlayerId,
+    chosen: &[ObjectId],
+    events: &mut Vec<GameEvent>,
+) {
+    let Some(search) = state.active_library_searches.get(&player) else {
+        return;
+    };
+    let cards = chosen
+        .iter()
+        .filter_map(|object_id| state.objects.get(object_id))
+        .filter_map(|object| {
+            let identity = ObjectIncarnationRef::from_object(object);
+            search
+                .looked_at()
+                .iter()
+                .any(|(_, _, looked_at)| *looked_at == identity)
+                .then(|| crate::game::visibility::capture_library_search_card_view(object))
+        })
+        .collect::<Vec<_>>();
+    if cards.is_empty() {
+        return;
+    }
+    events.push(GameEvent::HiddenSearchViewed {
+        searcher: search.searcher(),
+        cards,
+        audience: search.learned_audience().to_vec(),
+    });
+}
+
 /// Finalize the ordinary (non-partitioned) SearchChoice continuation. This is
 /// the single authority for both the synchronous selection path and a
 /// SearchFound batch resumed after one or more nested replacement pauses.
@@ -1167,6 +1205,7 @@ fn finalize_standard_search_selection(
     chosen: &[ObjectId],
     events: &mut Vec<GameEvent>,
 ) -> ResolutionChoiceOutcome {
+    emit_selected_search_visibility(state, player, chosen, events);
     state.active_search_decision_controls.remove(&player);
     set_priority(state, player);
     let events_before_drain = events.len();

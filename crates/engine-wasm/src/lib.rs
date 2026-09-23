@@ -2576,6 +2576,105 @@ mod viewer_priority_tests {
             "the authorized searcher retains both event-time transitions"
         );
     }
+
+    #[test]
+    fn production_transition_snapshot_hides_cross_owner_face_down_search_from_owner() {
+        use engine::game::effects::resolve_ability_chain;
+        use engine::game::engine::apply;
+        use engine::game::zones::create_object;
+        use engine::types::ability::{
+            ControllerRef, Effect, FaceDownProfile, QuantityExpr, ResolvedAbility,
+            SearchSelectionConstraint, TargetFilter, TargetRef, TypedFilter,
+        };
+        use engine::types::actions::GameAction;
+        use engine::types::identifiers::CardId;
+        use engine::types::zones::{EtbTapState, Zone};
+
+        let mut state = GameState::new_two_player(42);
+        let found = create_object(
+            &mut state,
+            CardId(2),
+            PlayerId(1),
+            "Cross-owner Secret".to_string(),
+            Zone::Library,
+        );
+        let exile = ResolvedAbility::new(
+            Effect::ChangeZone {
+                origin: Some(Zone::Library),
+                destination: Zone::Exile,
+                target: TargetFilter::Any,
+                owner_library: false,
+                enter_transformed: false,
+                enters_under: None,
+                enter_tapped: EtbTapState::Unspecified,
+                enters_attacking: false,
+                up_to: false,
+                enter_with_counters: Vec::new(),
+                conditional_enter_with_counters: Vec::new(),
+                face_down_profile: Some(FaceDownProfile::face_down_exile_marker()),
+                enters_modified_if: None,
+            },
+            Vec::new(),
+            ObjectId(101),
+            PlayerId(0),
+        );
+        let search = ResolvedAbility::new(
+            Effect::SearchLibrary {
+                filter: TargetFilter::Any,
+                count: QuantityExpr::Fixed { value: 1 },
+                reveal: false,
+                target_player: Some(TargetFilter::Typed(
+                    TypedFilter::default().controller(ControllerRef::Opponent),
+                )),
+                selection_constraint: SearchSelectionConstraint::None,
+                split: None,
+                source_zones: vec![Zone::Library],
+            },
+            vec![TargetRef::Player(PlayerId(1))],
+            ObjectId(101),
+            PlayerId(0),
+        )
+        .sub_ability(exile);
+
+        let mut setup_events = Vec::new();
+        resolve_ability_chain(&mut state, &search, &mut setup_events, 0)
+            .expect("cross-owner search must reach its selection prompt");
+        assert!(matches!(state.waiting_for, WaitingFor::SearchChoice { .. }));
+
+        let result = apply(
+            &mut state,
+            PlayerId(0),
+            GameAction::SelectCards { cards: vec![found] },
+        )
+        .expect("cross-owner selection must resolve the face-down exile continuation");
+        let searcher = viewer_transition_snapshot(&mut state, PlayerId(0), result.events.clone());
+        let owner = viewer_transition_snapshot(&mut state, PlayerId(1), result.events.clone());
+        let observer = viewer_transition_snapshot(&mut state, PlayerId(u8::MAX), result.events);
+        let searcher_events: Vec<GameEvent> = serde_json::from_value(searcher["events"].clone())
+            .expect("searcher event projection deserializes");
+        let owner_events: Vec<GameEvent> =
+            serde_json::from_value(owner["events"].clone()).expect("owner events deserialize");
+        let observer_events: Vec<GameEvent> = serde_json::from_value(observer["events"].clone())
+            .expect("observer event projection deserializes");
+
+        assert!(searcher_events.iter().any(|event| matches!(
+            event,
+            GameEvent::ZoneChanged { object_id, record, .. }
+                if *object_id == found && record.name == "Cross-owner Secret"
+        )));
+        for (label, events) in [("owner", owner_events), ("observer", observer_events)] {
+            assert!(
+                events.iter().all(|event| {
+                    !matches!(
+                        event,
+                        GameEvent::ZoneChanged { object_id, record, .. }
+                            if *object_id == found || record.name == "Cross-owner Secret"
+                    )
+                }),
+                "{label} must not receive the cross-owner private identity"
+            );
+        }
+    }
 }
 
 #[wasm_bindgen]
@@ -2655,7 +2754,11 @@ fn viewer_transition_snapshot(
 pub fn get_viewer_transition_snapshot_js(player_id: u32, events: JsValue) -> JsValue {
     let events: Vec<GameEvent> = match serde_wasm_bindgen::from_value(events) {
         Ok(events) => events,
-        Err(_) => return JsValue::NULL,
+        Err(error) => {
+            return JsValue::from_str(&format!(
+                "INVALID_TRANSITION_EVENTS: transition event payload could not be decoded: {error}"
+            ))
+        }
     };
     match with_state_mut(|state| {
         let viewer = PlayerId(player_id as u8);

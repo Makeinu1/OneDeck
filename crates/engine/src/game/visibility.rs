@@ -2337,25 +2337,38 @@ pub fn filter_events_for_viewer(
     viewer: PlayerId,
 ) -> Vec<GameEvent> {
     let spectator = !state.players.iter().any(|player| player.id == viewer);
-    // A hidden search and the zone transitions it causes are emitted in one
-    // event batch. Preserve the engine's latched audience when deciding
-    // whether a face-down transition may be shown; the final state alone can
-    // no longer tell us that the viewer actually looked at the card.
-    let search_knowledge: HashSet<ObjectId> = events
-        .iter()
-        .filter_map(|event| match event {
-            GameEvent::HiddenSearchViewed {
-                cards, audience, ..
-            } if audience.contains(&viewer) => {
-                Some(cards.iter().map(|card| card.identity.object_id))
+    // A hidden search and the zone transitions it causes may be emitted in
+    // separate action-result batches. Preserve both the engine's latched
+    // audience and the fact that an object came from that search; the final
+    // state alone can no longer tell us which viewer actually learned it.
+    let mut search_knowledge = HashSet::new();
+    let mut searched_objects = HashSet::new();
+    for event in events {
+        if let GameEvent::HiddenSearchViewed {
+            cards, audience, ..
+        } = event
+        {
+            for card in cards {
+                searched_objects.insert(card.identity.object_id);
+                if audience.contains(&viewer) {
+                    search_knowledge.insert(card.identity.object_id);
+                }
             }
-            _ => None,
-        })
-        .flatten()
-        .collect();
+        }
+    }
+    for (_, search) in state.active_library_searches.iter() {
+        for (_, _, identity) in search.looked_at() {
+            searched_objects.insert(identity.object_id);
+            if search.learned_audience().contains(&viewer) {
+                search_knowledge.insert(identity.object_id);
+            }
+        }
+    }
     events
         .iter()
-        .filter(|event| event_visible_to_viewer(event, state, viewer, &search_knowledge))
+        .filter(|event| {
+            event_visible_to_viewer(event, state, viewer, &search_knowledge, &searched_objects)
+        })
         .map(|event| match event {
             // `CardId` is assigned from the pre-shuffle object sequence when a
             // deck loads. An opponent can use it to recover hidden deck order,
@@ -2389,6 +2402,7 @@ fn event_visible_to_viewer(
     state: &GameState,
     viewer: PlayerId,
     search_knowledge: &HashSet<ObjectId>,
+    searched_objects: &HashSet<ObjectId>,
 ) -> bool {
     let can_view_private_for_player =
         |player: PlayerId| viewer_has_private_access_to_player(state, viewer, player);
@@ -2477,7 +2491,8 @@ fn event_visible_to_viewer(
                     .is_some_and(|object| object.face_down);
             !face_down
                 || search_knowledge.contains(object_id)
-                || can_view_private_for_player(record.owner)
+                || (!searched_objects.contains(object_id)
+                    && can_view_private_for_player(record.owner))
         }
         // CR 702.143a: foretell exiles a hand card face down. The zone-change
         // record snapshots its real name, so it is visible only to a viewer
@@ -2557,7 +2572,6 @@ fn library_zone_change_visible_to_viewer(
             }
             Zone::Exile => {
                 return event.search_knowledge.contains(&event.object_id)
-                    || can_view_private_for_player(event.owner)
                     || state.objects.get(&event.object_id).is_some_and(|obj| {
                         face_down_exile_visible_to_viewer(
                             state,

@@ -540,6 +540,10 @@ self.onmessage = async (e: MessageEvent<EngineRequest>) => {
 
       case "getViewerTransitionSnapshot": {
         const r = get_viewer_transition_snapshot_js(msg.viewerId, msg.events);
+        if (typeof r === "string") {
+          error(msg.id, r);
+          break;
+        }
         if (r === null) {
           error(msg.id, "NOT_INITIALIZED: get_viewer_transition_snapshot_js returned null");
           break;

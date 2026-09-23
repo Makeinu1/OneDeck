@@ -1614,6 +1614,7 @@ async function createMainThreadFallback(): Promise<MainThreadFallback> {
     getViewerTransitionSnapshot: (viewerId: number, events: GameEvent[]) =>
       enqueue(() => {
         const r = wasm.get_viewer_transition_snapshot_js(viewerId, events);
+        if (typeof r === "string") throw new Error(r);
         if (r === null) {
           throw new Error("NOT_INITIALIZED: get_viewer_transition_snapshot_js returned null");
         }
