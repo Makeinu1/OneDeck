@@ -2319,12 +2319,13 @@ pub fn get_legal_actions_js() -> JsValue {
 /// game logic into the transport adapter.
 #[wasm_bindgen]
 pub fn get_legal_actions_for_viewer_js(player_id: u32) -> JsValue {
+    let viewer = match viewer_player_id(player_id) {
+        Ok(viewer) => viewer,
+        Err(error) => return JsValue::from_str(&error),
+    };
     match with_state_mut(|state| {
         engine::game::layers::flush_layers(state);
-        to_js(&legal_actions_result_for_viewer(
-            state,
-            PlayerId(player_id as u8),
-        ))
+        to_js(&legal_actions_result_for_viewer(state, viewer))
     }) {
         Ok(val) => val,
         Err(_) => JsValue::NULL,

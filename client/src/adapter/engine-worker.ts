@@ -520,6 +520,10 @@ self.onmessage = async (e: MessageEvent<EngineRequest>) => {
 
       case "getLegalActionsForViewer": {
         const r = get_legal_actions_for_viewer_js(msg.viewerId);
+        if (typeof r === "string") {
+          error(msg.id, r);
+          break;
+        }
         if (r === null) {
           error(msg.id, "NOT_INITIALIZED: get_legal_actions_for_viewer_js returned null");
           break;

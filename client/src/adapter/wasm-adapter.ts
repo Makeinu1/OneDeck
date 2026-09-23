@@ -1600,6 +1600,7 @@ async function createMainThreadFallback(): Promise<MainThreadFallback> {
     getLegalActionsForViewer: (viewerId: number) =>
       enqueue(() => {
         const r = wasm.get_legal_actions_for_viewer_js(viewerId);
+        if (typeof r === "string") throw new Error(r);
         if (r === null) throw new Error("NOT_INITIALIZED: get_legal_actions_for_viewer_js returned null");
         return r as LegalActionsResult;
       }),
