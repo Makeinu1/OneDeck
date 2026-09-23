@@ -1,5 +1,5 @@
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process;
 
 use engine::database::CardDatabase;
@@ -10,6 +10,17 @@ use engine::game::coverage::{
 use engine::parser::oracle_ir::diagnostic::{OracleDiagnostic, OracleItemId, OracleSourceSpan};
 use engine::types::card::CardFace;
 use serde::Serialize;
+use sha2::{Digest, Sha256};
+
+fn source_corpus_hash(data_root: &Path) -> Option<String> {
+    // The CI oracle export reads this exact MTGJSON file. CardTypes.json is
+    // consulted only by the explicit --write-subtypes maintenance path, and
+    // per-set files only enrich metadata that coverage-regression-check does
+    // not compare; neither is part of the parser-coverage corpus fence.
+    let source = data_root.join("mtgjson/AtomicCards.json");
+    let bytes = std::fs::read(source).ok()?;
+    Some(format!("{:x}", Sha256::digest(bytes)))
+}
 
 #[derive(Debug, Serialize)]
 struct WarningDrilldown {
@@ -275,6 +286,7 @@ fn main() {
             gap_bundles: vec![],
             parse_warning_patterns: vec![],
             diagnostics: Default::default(),
+            source_corpus_hash: None,
         };
         println!("{}", serde_json::to_string_pretty(&empty).unwrap());
         process::exit(0);
@@ -303,6 +315,7 @@ fn main() {
                 gap_bundles: vec![],
                 parse_warning_patterns: vec![],
                 diagnostics: Default::default(),
+                source_corpus_hash: None,
             };
             println!("{}", serde_json::to_string_pretty(&empty).unwrap());
             process::exit(1);
@@ -310,6 +323,10 @@ fn main() {
     };
 
     let mut summary = analyze_coverage(&db);
+    // Keep the artifact self-describing. The hash covers the exact raw bytes
+    // consumed by oracle-gen, not its generated output, so parser changes do
+    // not masquerade as an external-corpus change.
+    summary.source_corpus_hash = source_corpus_hash(&path);
 
     // Populate per-category diagnostic counts for JSON output (D-08).
     {

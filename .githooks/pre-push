@@ -40,6 +40,8 @@ echo "  [cards] coverage-report"
 mkdir -p "$tmpdir/data"
 cp "$tmpdir/card-data.json" "$tmpdir/data/card-data.json"
 cp "$tmpdir/card-names.json" "$tmpdir/data/card-names.json"
+mkdir -p "$tmpdir/data/mtgjson"
+cp data/mtgjson/AtomicCards.json "$tmpdir/data/mtgjson/AtomicCards.json"
 cargo run --profile tool --bin coverage-report -- "$tmpdir/data" --all > "$tmpdir/coverage-data.json"
 
 echo "  [cards] coverage regression check"

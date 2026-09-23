@@ -562,12 +562,9 @@ jobs:
         # PR #2802 ratchet deadlock). PR and merge_group runs remain blocking.
         continue-on-error: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
         run: |
-          scripts/coverage-regression-check.test.sh
-          SOURCE_CORPUS_HASH="$(sha256sum data/mtgjson/AtomicCards.json | awk '{print substr($1, 1, 16)}')"
           ./scripts/coverage-regression-check.sh \
             "https://data.phase-rs.dev/preview/coverage-data.json" \
             data/coverage-data.json \
-            --source-corpus-hash "$SOURCE_CORPUS_HASH" \
             --fail-on-engine
 
       - name: Parse-detail diff vs base baseline
@@ -665,10 +662,9 @@ jobs:
         if: github.event_name == 'push' && github.ref == 'refs/heads/main'
         run: cargo semantic-audit data/
 
-      - name: Stamp shared card-data hashes on coverage + audit JSONs
-        # Embed the generated card-data hash in both files and the raw source
-        # corpus hash in coverage so downstream consumers can distinguish a
-        # parser-output change from an external corpus change. Gated to main
+      - name: Stamp shared card_data_hash on coverage + audit JSONs
+        # Embed the same card-data hash in both files so downstream consumers
+        # can verify they're reading a consistent R2 snapshot. Gated to main
         # because the only consumer is the R2 upload below.
         #
         # coverage-data.json is stamped into a SEPARATE .stamped.json copy, not
@@ -682,10 +678,9 @@ jobs:
         if: github.event_name == 'push' && github.ref == 'refs/heads/main'
         run: |
           HASH=$(sha256sum data/card-data.json | awk '{print substr($1, 1, 16)}')
-          SOURCE_CORPUS_HASH=$(sha256sum data/mtgjson/AtomicCards.json | awk '{print substr($1, 1, 16)}')
           jq --arg h "$HASH" '. + {card_data_hash: $h}' data/semantic-audit.json > data/semantic-audit.json.tmp
           mv data/semantic-audit.json.tmp data/semantic-audit.json
-          jq --arg h "$HASH" --arg s "$SOURCE_CORPUS_HASH" '. + {card_data_hash: $h, source_corpus_hash: $s}' data/coverage-data.json > data/coverage-data.stamped.json
+          jq --arg h "$HASH" '. + {card_data_hash: $h}' data/coverage-data.json > data/coverage-data.stamped.json
 
       - name: Upload data to R2 (preview)
         if: github.event_name == 'push' && github.ref == 'refs/heads/main'

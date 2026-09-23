@@ -32,7 +32,6 @@
 #   <baseline>  path OR https URL to main-branch coverage-data.json
 #   <current>   path to the newly produced coverage-data.json
 #   --fail-on-engine  exit 1 if REGRESSED (engine) bucket is non-empty
-#   --source-corpus-hash HASH  hash of the raw MTGJSON corpus (first 16 hex)
 #
 # The coverage-data.json layout comes from `coverage-report` (see
 # crates/engine/src/bin/coverage_report.rs): .cards[] with .card_name,
@@ -48,21 +47,12 @@ fi
 BASELINE="$1"
 CURRENT="$2"
 FAIL_ON_ENGINE=0
-CURRENT_SOURCE_CORPUS_HASH=""
 shift 2
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --fail-on-engine)
             FAIL_ON_ENGINE=1
             shift
-            ;;
-        --source-corpus-hash)
-            if [[ $# -lt 2 || -z "$2" ]]; then
-                echo "--source-corpus-hash requires a value" >&2
-                exit 2
-            fi
-            CURRENT_SOURCE_CORPUS_HASH="$2"
-            shift 2
             ;;
         *)
             echo "unknown option: $1" >&2
@@ -94,21 +84,25 @@ if [[ ! -s "$CURRENT" ]]; then
 fi
 
 # A support/diagnostic comparison is only meaningful when both files were
-# generated from the same raw card-data corpus. The current coverage JSON is
-# checked before the main-only stamp step, so CI passes the source hash explicitly.
-# Refuse to compare mixed epochs rather than treating Oracle churn as a parser
-# regression or silently skipping the gate.
+# generated from the same raw card-data corpus. `coverage-report` emits this
+# identity from the exact MTGJSON bytes it consumes, keeping every caller on
+# one authority. Refuse to compare mixed epochs rather than treating Oracle
+# churn as a parser regression or silently skipping the gate.
 BASELINE_SOURCE_CORPUS_HASH="$(jq -r '.source_corpus_hash // empty' "$BASELINE")"
+CURRENT_SOURCE_CORPUS_HASH="$(jq -r '.source_corpus_hash // empty' "$CURRENT")"
 if [[ -z "$BASELINE_SOURCE_CORPUS_HASH" ]]; then
-    echo "CARD DATA DRIFT: baseline has no source_corpus_hash; refusing cross-corpus comparison." >&2
+    echo "CORPUS_IDENTITY_MISSING: baseline has no source_corpus_hash; refusing cross-corpus comparison." >&2
+    echo "CARD DATA DRIFT: refusing comparison without a baseline corpus identity." >&2
     exit 2
 fi
 if [[ -z "$CURRENT_SOURCE_CORPUS_HASH" ]]; then
-    echo "CARD DATA DRIFT: current source corpus hash was not supplied; refusing comparison." >&2
+    echo "CORPUS_IDENTITY_MISSING: current has no source_corpus_hash; refusing cross-corpus comparison." >&2
+    echo "CARD DATA DRIFT: refusing comparison without a current corpus identity." >&2
     exit 2
 fi
 if [[ "$BASELINE_SOURCE_CORPUS_HASH" != "$CURRENT_SOURCE_CORPUS_HASH" ]]; then
-    echo "CARD DATA DRIFT: baseline corpus $BASELINE_SOURCE_CORPUS_HASH != current corpus $CURRENT_SOURCE_CORPUS_HASH." >&2
+    echo "CORPUS_MISMATCH: baseline corpus $BASELINE_SOURCE_CORPUS_HASH != current corpus $CURRENT_SOURCE_CORPUS_HASH." >&2
+    echo "CARD DATA DRIFT: refusing cross-corpus comparison." >&2
     echo "Refresh the published baseline for the current MTGJSON/card-data corpus before comparing coverage." >&2
     exit 2
 fi
