@@ -2337,9 +2337,25 @@ pub fn filter_events_for_viewer(
     viewer: PlayerId,
 ) -> Vec<GameEvent> {
     let spectator = !state.players.iter().any(|player| player.id == viewer);
+    // A hidden search and the zone transitions it causes are emitted in one
+    // event batch. Preserve the engine's latched audience when deciding
+    // whether a face-down transition may be shown; the final state alone can
+    // no longer tell us that the viewer actually looked at the card.
+    let search_knowledge: HashSet<ObjectId> = events
+        .iter()
+        .filter_map(|event| match event {
+            GameEvent::HiddenSearchViewed {
+                cards, audience, ..
+            } if audience.contains(&viewer) => {
+                Some(cards.iter().map(|card| card.identity.object_id))
+            }
+            _ => None,
+        })
+        .flatten()
+        .collect();
     events
         .iter()
-        .filter(|event| event_visible_to_viewer(event, state, viewer))
+        .filter(|event| event_visible_to_viewer(event, state, viewer, &search_knowledge))
         .map(|event| match event {
             // `CardId` is assigned from the pre-shuffle object sequence when a
             // deck loads. An opponent can use it to recover hidden deck order,
@@ -2368,7 +2384,12 @@ pub fn filter_events_for_viewer(
         .collect()
 }
 
-fn event_visible_to_viewer(event: &GameEvent, state: &GameState, viewer: PlayerId) -> bool {
+fn event_visible_to_viewer(
+    event: &GameEvent,
+    state: &GameState,
+    viewer: PlayerId,
+    search_knowledge: &HashSet<ObjectId>,
+) -> bool {
     let can_view_private_for_player =
         |player: PlayerId| viewer_has_private_access_to_player(state, viewer, player);
 
@@ -2386,9 +2407,16 @@ fn event_visible_to_viewer(event: &GameEvent, state: &GameState, viewer: PlayerI
         } if *from == Some(Zone::Library) => library_zone_change_visible_to_viewer(
             state,
             viewer,
-            *object_id,
-            *to,
-            record.owner,
+            LibraryZoneChangeVisibility {
+                object_id: *object_id,
+                to: *to,
+                owner: record.owner,
+                controller: record.controller,
+                event_face_down: record
+                    .trigger_source_context()
+                    .map(|context| context.face_down),
+                search_knowledge,
+            },
             &can_view_private_for_player,
         ),
         // CR 701.17c + CR 400.2: a milled card can be found "as long as that
@@ -2404,12 +2432,20 @@ fn event_visible_to_viewer(event: &GameEvent, state: &GameState, viewer: PlayerI
         } => library_zone_change_visible_to_viewer(
             state,
             viewer,
-            *object_id,
-            *to,
-            state
-                .objects
-                .get(object_id)
-                .map_or(*player_id, |obj| obj.owner),
+            LibraryZoneChangeVisibility {
+                object_id: *object_id,
+                to: *to,
+                owner: state
+                    .objects
+                    .get(object_id)
+                    .map_or(*player_id, |obj| obj.owner),
+                controller: state
+                    .objects
+                    .get(object_id)
+                    .map_or(*player_id, |obj| obj.controller),
+                event_face_down: None,
+                search_knowledge,
+            },
             &can_view_private_for_player,
         ),
         // CR 400.2: A mulligan moves cards from one hidden zone to another.
@@ -2421,6 +2457,28 @@ fn event_visible_to_viewer(event: &GameEvent, state: &GameState, viewer: PlayerI
             record,
             ..
         } => can_view_private_for_player(record.owner),
+        // A face-down card may leave exile in the same transition batch that
+        // recorded the private search. The live object is already face-up in
+        // its destination, so use the event-time record and the searcher's
+        // latched audience instead of the final state.
+        GameEvent::ZoneChanged {
+            object_id,
+            from: Some(Zone::Exile),
+            to: Zone::Hand | Zone::Library,
+            record,
+            ..
+        } => {
+            let face_down = record
+                .trigger_source_context()
+                .is_some_and(|context| context.face_down)
+                || state
+                    .objects
+                    .get(object_id)
+                    .is_some_and(|object| object.face_down);
+            !face_down
+                || search_knowledge.contains(object_id)
+                || can_view_private_for_player(record.owner)
+        }
         // CR 702.143a: foretell exiles a hand card face down. The zone-change
         // record snapshots its real name, so it is visible only to a viewer
         // who may look at that face-down exiled card.
@@ -2428,16 +2486,27 @@ fn event_visible_to_viewer(event: &GameEvent, state: &GameState, viewer: PlayerI
             object_id,
             from: Some(Zone::Hand),
             to: Zone::Exile,
+            record,
             ..
-        } => state.objects.get(object_id).is_none_or(|obj| {
-            !obj.face_down
-                || face_down_exile_visible_to_viewer(
-                    state,
-                    *object_id,
-                    obj,
-                    &can_view_private_for_player,
-                )
-        }),
+        } => {
+            let face_down = record
+                .trigger_source_context()
+                .is_some_and(|context| context.face_down)
+                || state
+                    .objects
+                    .get(object_id)
+                    .is_some_and(|object| object.face_down);
+            !face_down
+                || search_knowledge.contains(object_id)
+                || state.objects.get(object_id).is_some_and(|obj| {
+                    face_down_exile_visible_to_viewer(
+                        state,
+                        *object_id,
+                        obj,
+                        &can_view_private_for_player,
+                    )
+                })
+        }
         _ => true,
     }
 }
@@ -2448,35 +2517,55 @@ fn event_visible_to_viewer(event: &GameEvent, state: &GameState, viewer: PlayerI
 /// face-down manifest/cloak moves and face-down exiles must be gated the same
 /// way `filter_state_for_viewer` gates the post-move object — not by a fixed
 /// destination-zone allowlist.
-fn library_zone_change_visible_to_viewer(
-    state: &GameState,
-    viewer: PlayerId,
+struct LibraryZoneChangeVisibility<'a> {
     object_id: ObjectId,
     to: Zone,
     owner: PlayerId,
+    controller: PlayerId,
+    event_face_down: Option<bool>,
+    search_knowledge: &'a HashSet<ObjectId>,
+}
+
+fn library_zone_change_visible_to_viewer(
+    state: &GameState,
+    viewer: PlayerId,
+    event: LibraryZoneChangeVisibility<'_>,
     can_view_private_for_player: &impl Fn(PlayerId) -> bool,
 ) -> bool {
-    if matches!(to, Zone::Hand | Zone::Library) {
-        return viewer_has_private_access_to_player(state, viewer, owner);
+    if matches!(event.to, Zone::Hand | Zone::Library) {
+        return viewer_has_private_access_to_player(state, viewer, event.owner);
     }
 
-    let Some(obj) = state.objects.get(&object_id) else {
-        return true;
-    };
-
-    if obj.face_down {
-        match to {
+    let face_down = event.event_face_down.unwrap_or_else(|| {
+        state
+            .objects
+            .get(&event.object_id)
+            .is_some_and(|object| object.face_down)
+    });
+    if face_down {
+        match event.to {
             Zone::Battlefield | Zone::Stack => {
-                return can_view_private_for_player(obj.controller)
-                    || viewer_may_look_at_face_down(state, object_id, can_view_private_for_player);
+                return event.search_knowledge.contains(&event.object_id)
+                    || can_view_private_for_player(event.controller)
+                    || state.objects.get(&event.object_id).is_some_and(|_| {
+                        viewer_may_look_at_face_down(
+                            state,
+                            event.object_id,
+                            can_view_private_for_player,
+                        )
+                    });
             }
             Zone::Exile => {
-                return face_down_exile_visible_to_viewer(
-                    state,
-                    object_id,
-                    obj,
-                    can_view_private_for_player,
-                );
+                return event.search_knowledge.contains(&event.object_id)
+                    || can_view_private_for_player(event.owner)
+                    || state.objects.get(&event.object_id).is_some_and(|obj| {
+                        face_down_exile_visible_to_viewer(
+                            state,
+                            event.object_id,
+                            obj,
+                            can_view_private_for_player,
+                        )
+                    });
             }
             _ => {}
         }

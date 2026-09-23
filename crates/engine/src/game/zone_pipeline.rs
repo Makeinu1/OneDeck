@@ -1302,7 +1302,7 @@ fn deliver_batch(
         match move_object_with_terminal(state, req, events) {
             ZoneMoveTerminalResult::Completed(completion) => {
                 if face_down_in_exile {
-                    mark_face_down_if_exiled(state, object_id);
+                    mark_face_down_if_exiled(state, object_id, &mut events[delivery_start..]);
                 }
                 logical_zone_change_group
                     .record_delivery_completion(object_id, completion)
@@ -1386,13 +1386,37 @@ fn deliver_batch(
     BatchDeliveryResult::Done(Box::new(logical_zone_change_group))
 }
 
-fn mark_face_down_if_exiled(state: &mut GameState, object_id: ObjectId) {
+fn mark_face_down_if_exiled(state: &mut GameState, object_id: ObjectId, events: &mut [GameEvent]) {
     if let Some(object) = state
         .objects
         .get_mut(&object_id)
         .filter(|object| object.zone == Zone::Exile)
     {
         object.face_down = true;
+    }
+    mark_zone_change_record_face_down(events, object_id);
+}
+
+/// CR 406.3: keep the event-time concealment bit in sync with a delivery that
+/// applies its face-down exile marker after `move_to_zone` emitted the record.
+fn mark_zone_change_record_face_down(events: &mut [GameEvent], object_id: ObjectId) {
+    for event in events.iter_mut().rev() {
+        let GameEvent::ZoneChanged {
+            object_id: event_object_id,
+            to: Zone::Exile,
+            record,
+            ..
+        } = event
+        else {
+            continue;
+        };
+        if *event_object_id != object_id {
+            continue;
+        }
+        if let Some(context) = record.trigger_source_context.as_mut() {
+            context.face_down = true;
+        }
+        break;
     }
 }
 
@@ -3540,7 +3564,9 @@ pub(crate) fn deliver_replaced_zone_change(
         // `move_to_zone` early-return WITHOUT moving the object (CR 614.1d), and a
         // blocked manifest/morph entry must not strand the card face down in its
         // origin zone.
-        let face_down_preflight = to == Zone::Battlefield && face_down_profile.is_some();
+        let face_down_in_exile = to == Zone::Exile && face_down_profile.is_some();
+        let face_down_battlefield = to == Zone::Battlefield && face_down_profile.is_some();
+        let face_down_preflight = face_down_battlefield || face_down_in_exile;
         let prior_face_down = if face_down_preflight {
             state.objects.get(&object_id).map(|obj| obj.face_down)
         } else {
@@ -3627,6 +3653,10 @@ pub(crate) fn deliver_replaced_zone_change(
                 .objects
                 .get(&object_id)
                 .is_some_and(|obj| obj.zone == Zone::Battlefield);
+        let settled_in_destination = state
+            .objects
+            .get(&object_id)
+            .is_some_and(|obj| obj.zone == to);
         // CR 701.9a + CR 614.1: The inner move has now completed with its
         // final replacement-selected destination. Append one operation-owned
         // result exactly once; a prevented move never reaches this delivery.
@@ -3672,7 +3702,7 @@ pub(crate) fn deliver_replaced_zone_change(
         // rather than stranded face down (corrupting hidden state for a move that
         // never happened). On a successful entry the flag is re-asserted by
         // `apply_face_down_entry_profile` below, so this restore is inert.
-        if face_down_preflight && !entered_battlefield {
+        if face_down_preflight && !settled_in_destination {
             if let (Some(prior), Some(obj)) = (prior_face_down, state.objects.get_mut(&object_id)) {
                 obj.face_down = prior;
             }
@@ -3741,7 +3771,7 @@ pub(crate) fn deliver_replaced_zone_change(
         // a card that never moved (CR 614.1d). Combined with the preflight rollback
         // above, a blocked manifest/morph leaves the card fully unchanged.
         if entered_battlefield {
-            if let Some(profile) = &face_down_profile {
+            if let Some(profile) = face_down_profile.as_ref() {
                 apply_face_down_entry_profile(state, object_id, profile);
             }
             // CR 608.2c: a permanent the instruction just produced is the
@@ -3762,6 +3792,17 @@ pub(crate) fn deliver_replaced_zone_change(
             if chain_referent.publishes() {
                 crate::game::morph::publish_face_down_entry_referent(state, object_id);
             }
+        }
+        // CR 406.3: A face-down exile must be hidden BEFORE the next
+        // sequential move in the same resolution. The preflight flag makes
+        // the ZoneChangeRecord snapshot event-time accurate; reassert the
+        // settled object flag after zone-exit cleanup and patch alternate
+        // delivery records that were emitted before the flag was applied.
+        if face_down_in_exile && settled_in_destination {
+            if let Some(object) = state.objects.get_mut(&object_id) {
+                object.face_down = true;
+            }
+            mark_zone_change_record_face_down(events, object_id);
         }
         // CR 614.12a + CR 616.1c + CR 707.2: An enter-as-copy replacement
         // selected its copy source before this delivery and carried those
@@ -4418,6 +4459,22 @@ fn execute_zone_move_with_applied_terminal(
     // `face_down_profile` is present.
     match replacement::replace_event(state, proposed, events) {
         ReplacementResult::Execute(mut event) => {
+            // A face-down profile is destination-specific. The parser uses the
+            // existing profile carrier as the intent for a face-down Exile
+            // search, while ordinary profiles describe a Battlefield entry.
+            // If a replacement changes the requested destination, the profile
+            // must not follow it and accidentally turn a redirected move into
+            // a face-down arrival in the wrong zone.
+            if let ProposedEvent::ZoneChange {
+                to,
+                face_down_profile,
+                ..
+            } = &mut event
+            {
+                if *to != dest_zone {
+                    *face_down_profile = None;
+                }
+            }
             let mut pending_aura_choice: Option<(PlayerId, ObjectId, Vec<TargetRef>)> = None;
             // CR 303.4g: set when the unhosted entrant came from the stack and so
             // must be put into its owner's graveyard rather than remain. Acted on

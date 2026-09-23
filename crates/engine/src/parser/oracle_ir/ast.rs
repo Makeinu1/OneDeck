@@ -397,6 +397,10 @@ pub(crate) enum ContinuationAst {
     /// library-to-hand search continuation are already represented by the intrinsic
     /// SearchDestination + reveal flag and should be absorbed.
     SearchResultClauseHandled,
+    /// CR 406.3: "exile it/them face down" after a library search. The
+    /// continuation is absorbed after marking the generated library-to-exile
+    /// `ChangeZone` with an event-time concealment intent.
+    ExileSearchResultFaceDown,
     /// "reveal it" immediately after a SearchLibrary whose destination is handled
     /// by a later conditional branch. Patches SearchLibrary.reveal without adding
     /// a default ChangeZone.

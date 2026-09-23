@@ -5304,6 +5304,21 @@ pub(super) fn apply_clause_continuation(
             }
         }
         ContinuationAst::SearchResultClauseHandled => {}
+        ContinuationAst::ExileSearchResultFaceDown => {
+            let Some(previous) = defs.last_mut() else {
+                return;
+            };
+            if let Effect::ChangeZone {
+                origin: Some(Zone::Library),
+                destination: Zone::Exile,
+                face_down_profile,
+                ..
+            } = &mut *previous.effect
+            {
+                *face_down_profile =
+                    Some(crate::types::ability::FaceDownProfile::face_down_exile_marker());
+            }
+        }
         ContinuationAst::PutChoiceRemainderOnBottom => {
             let Some(previous) = defs.last_mut() else {
                 return;
@@ -6068,6 +6083,7 @@ pub(super) fn continuation_absorbs_current(
         ContinuationAst::ChooseFromExile { .. } => true,
         ContinuationAst::SearchRevealResult => true,
         ContinuationAst::SearchResultClauseHandled => true,
+        ContinuationAst::ExileSearchResultFaceDown => true,
         ContinuationAst::PutChoiceRemainderOnBottom => true,
         ContinuationAst::ChoicePartitionDestinations { .. } => true,
         ContinuationAst::PutChosenCardsAtLibraryPosition { .. } => true,
@@ -8163,16 +8179,26 @@ pub(super) fn parse_followup_continuation_ast(
             ..
         } if matches!(
             lower.trim(),
-            "exile it"
-                | "exile it face down"
-                | "exile that card"
+            "exile it face down"
                 | "exile that card face down"
-                | "exile the card"
                 | "exile the card face down"
-                | "exile them"
                 | "exile them face down"
-                | "exile those cards"
                 | "exile those cards face down"
+        ) =>
+        {
+            Some(ContinuationAst::ExileSearchResultFaceDown)
+        }
+        Effect::ChangeZone {
+            origin: Some(Zone::Library),
+            destination: Zone::Exile,
+            ..
+        } if matches!(
+            lower.trim(),
+            "exile it"
+                | "exile that card"
+                | "exile the card"
+                | "exile them"
+                | "exile those cards"
         ) =>
         {
             Some(ContinuationAst::SearchResultClauseHandled)
@@ -9962,6 +9988,39 @@ mod tests {
         let result =
             parse_followup_continuation_ast("exile them", &previous, &mut ParseContext::default());
         assert_eq!(result, Some(ContinuationAst::SearchResultClauseHandled));
+    }
+
+    #[test]
+    fn search_exile_face_down_followup_carries_event_time_exile_marker() {
+        use super::super::parse_effect_chain;
+
+        let def = parse_effect_chain(
+            "Search your library for a card, exile it face down, then shuffle.",
+            AbilityKind::Spell,
+        );
+        let mut node = Some(&def);
+        let mut found_marker = false;
+        while let Some(current) = node {
+            if let Effect::ChangeZone {
+                origin: Some(Zone::Library),
+                destination: Zone::Exile,
+                face_down_profile: Some(profile),
+                ..
+            } = &*current.effect
+            {
+                assert_eq!(
+                    profile,
+                    &crate::types::ability::FaceDownProfile::vanilla_2_2(),
+                    "the parser must carry an event-time concealment marker"
+                );
+                found_marker = true;
+            }
+            node = current.sub_ability.as_deref();
+        }
+        assert!(
+            found_marker,
+            "search destination must retain the exile marker"
+        );
     }
 
     /// CR 701.23a + CR 701.18a (cluster 35 / Mana Severance): comma-split

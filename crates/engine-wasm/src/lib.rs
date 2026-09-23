@@ -2507,6 +2507,75 @@ mod viewer_priority_tests {
             serde_json::to_value(vec![event]).expect("event serializes")
         );
     }
+
+    #[test]
+    fn production_transition_snapshot_hides_beseech_face_down_moves_from_opponent() {
+        use engine::game::ability_utils::build_resolved_from_def;
+        use engine::game::effects::resolve_ability_chain;
+        use engine::game::engine::apply;
+        use engine::game::zones::create_object;
+        use engine::parser::oracle_effect::parse_effect_chain;
+        use engine::types::ability::AbilityKind;
+        use engine::types::actions::GameAction;
+        use engine::types::card_type::CoreType;
+        use engine::types::identifiers::CardId;
+
+        let mut state = GameState::new_two_player(42);
+        let found = create_object(
+            &mut state,
+            CardId(1),
+            PlayerId(0),
+            "Found Spell".to_string(),
+            engine::types::zones::Zone::Library,
+        );
+        state
+            .objects
+            .get_mut(&found)
+            .expect("searched card exists")
+            .card_types
+            .core_types
+            .push(CoreType::Sorcery);
+        let ability = parse_effect_chain(
+            "search your library for a card, exile it face down, then shuffle. if this spell was bargained, you may cast the exiled card without paying its mana cost if that spell's mana value is 4 or less. put the exiled card into your hand if it wasn't cast this way",
+            AbilityKind::Spell,
+        );
+        let resolved = build_resolved_from_def(&ability, ObjectId(100), PlayerId(0));
+        let mut setup_events = Vec::new();
+        resolve_ability_chain(&mut state, &resolved, &mut setup_events, 0)
+            .expect("Beseech search must reach its selection prompt");
+        assert!(matches!(state.waiting_for, WaitingFor::SearchChoice { .. }));
+
+        let result = apply(
+            &mut state,
+            PlayerId(0),
+            GameAction::SelectCards { cards: vec![found] },
+        )
+        .expect("Beseech selection must resolve its exile-to-hand continuation");
+        let opponent = viewer_transition_snapshot(&mut state, PlayerId(1), result.events.clone());
+        let owner = viewer_transition_snapshot(&mut state, PlayerId(0), result.events);
+        let opponent_events: Vec<GameEvent> = serde_json::from_value(opponent["events"].clone())
+            .expect("opponent event projection deserializes");
+        let owner_events: Vec<GameEvent> =
+            serde_json::from_value(owner["events"].clone()).expect("owner events deserialize");
+
+        assert!(opponent_events.iter().all(|event| {
+            !matches!(
+                event,
+                GameEvent::ZoneChanged { object_id, .. } if *object_id == found
+            )
+        }));
+        assert_eq!(
+            owner_events
+                .iter()
+                .filter(|event| matches!(
+                    event,
+                    GameEvent::ZoneChanged { object_id, .. } if *object_id == found
+                ))
+                .count(),
+            2,
+            "the authorized searcher retains both event-time transitions"
+        );
+    }
 }
 
 #[wasm_bindgen]

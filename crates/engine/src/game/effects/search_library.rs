@@ -1984,12 +1984,58 @@ mod tests {
         resolve_ability_chain(&mut state, &resolved, &mut events, 0).unwrap();
         assert!(matches!(state.waiting_for, WaitingFor::SearchChoice { .. }));
 
-        apply(
+        let result = apply(
             &mut state,
             PlayerId(0),
             GameAction::SelectCards { cards: vec![found] },
         )
         .unwrap();
+
+        let face_down_moves: Vec<_> = result
+            .events
+            .iter()
+            .filter_map(|event| match event {
+                GameEvent::ZoneChanged {
+                    object_id,
+                    from,
+                    to,
+                    record,
+                } if *object_id == found
+                    && ((*from == Some(Zone::Library) && *to == Zone::Exile)
+                        || (*from == Some(Zone::Exile) && *to == Zone::Hand)) =>
+                {
+                    Some(record)
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(face_down_moves.len(), 2);
+        assert!(face_down_moves.iter().all(|record| {
+            record
+                .trigger_source_context()
+                .is_some_and(|context| context.face_down)
+        }));
+        let opponent_events =
+            crate::game::visibility::filter_events_for_viewer(&result.events, &state, PlayerId(1));
+        assert!(opponent_events.iter().all(|event| {
+            !matches!(
+                event,
+                GameEvent::ZoneChanged { object_id, .. } if *object_id == found
+            )
+        }));
+        let owner_events =
+            crate::game::visibility::filter_events_for_viewer(&result.events, &state, PlayerId(0));
+        assert_eq!(
+            owner_events
+                .iter()
+                .filter(|event| matches!(
+                    event,
+                    GameEvent::ZoneChanged { object_id, .. } if *object_id == found
+                ))
+                .count(),
+            2,
+            "the searching owner retains both transition events"
+        );
 
         assert!(
             !matches!(state.waiting_for, WaitingFor::OptionalEffectChoice { .. }),

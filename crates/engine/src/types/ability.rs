@@ -15403,6 +15403,14 @@ impl FaceDownProfile {
         self
     }
 
+    /// CR 406.3: marker carried by a `ChangeZone` that exiles a card face down.
+    /// `FaceDownProfile` is already the engine-owned delivery carrier for
+    /// face-down moves. For an Exile destination its presence is the concealment
+    /// intent; the battlefield-only characteristics and cause are ignored.
+    pub fn face_down_exile_marker() -> Self {
+        Self::vanilla_2_2()
+    }
+
     /// CR 701.58a: The cloak face-down characteristics — a vanilla 2/2 creature
     /// with ward {2}. Otherwise identical to [`Self::vanilla_2_2`]; the card can
     /// still be turned face up for its mana cost if it's a creature card.
@@ -16329,9 +16337,11 @@ pub enum Effect {
         /// matches `filter`, not via a post-move `PutCounter` sub-ability.
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         conditional_enter_with_counters: Vec<(TargetFilter, CounterType, QuantityExpr)>,
-        /// CR 708.2a + CR 708.3: when `Some`, the object that enters the
-        /// battlefield via this move is turned face down (before entry, CR
-        /// 708.3) with these characteristics. `None` = normal face-up entry.
+        /// CR 708.2a + CR 708.3: when `Some` for a Battlefield destination,
+        /// the object is turned face down before entry with these
+        /// characteristics. For an Exile destination, the existing profile
+        /// carrier may instead mark a CR 406.3 face-down landing; the delivery
+        /// tail interprets that intent without applying battlefield values.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         face_down_profile: Option<FaceDownProfile>,
         /// CR 614.12: gates the `enter_tapped`/`enters_attacking` riders on the
