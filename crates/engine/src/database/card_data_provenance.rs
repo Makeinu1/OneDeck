@@ -14,11 +14,13 @@ pub struct CardDataProvenance {
 }
 
 impl CardDataProvenance {
+    /// Read a provenance sidecar from disk.
     pub fn read(path: &Path) -> io::Result<Self> {
         let bytes = fs::read(path)?;
         serde_json::from_slice(&bytes).map_err(io::Error::other)
     }
 
+    /// Check that both recorded identities are lowercase SHA-256 strings.
     pub fn hashes_are_well_formed(&self) -> bool {
         [
             self.source_corpus_sha256.as_str(),
@@ -33,6 +35,7 @@ impl CardDataProvenance {
         })
     }
 
+    /// Write the sidecar through a same-directory temporary file and rename.
     pub fn write_atomic(&self, path: &Path) -> io::Result<()> {
         let parent = path.parent().unwrap_or_else(|| Path::new("."));
         let file_name = path.file_name().ok_or_else(|| {
