@@ -57,6 +57,47 @@ cp "$tmpdir/default/data/mtgjson/AtomicCards.json" \
 "$COVERAGE_REPORT_BIN" "$tmpdir/identity/data" --brief >"$tmpdir/identity/coverage.json"
 [[ "$(jq -r '.source_corpus_hash' "$tmpdir/identity/coverage.json")" == "$hash_b" ]]
 
+# Output/provenance destinations must be distinct before either file is written.
+mkdir -p "$tmpdir/collision/relative"
+printf 'sentinel\n' >"$tmpdir/collision/card-data.json"
+if "$ORACLE_GEN_BIN" "$tmpdir/default/data" \
+  --mtgjson "$tmpdir/corpus-b.json" \
+  --output "$tmpdir/collision/card-data.json" \
+  --provenance-out "$tmpdir/collision/card-data.json" \
+  >"$tmpdir/collision/literal.out" 2>"$tmpdir/collision/literal.err"; then
+  echo "expected literal output/provenance collision to fail" >&2
+  exit 1
+fi
+grep -Fq -- '--output and --provenance-out must be different paths' \
+  "$tmpdir/collision/literal.err"
+[[ "$(cat "$tmpdir/collision/card-data.json")" == 'sentinel' ]]
+
+if "$ORACLE_GEN_BIN" "$tmpdir/default/data" \
+  --mtgjson "$tmpdir/corpus-b.json" \
+  --output "$tmpdir/collision/relative/card-data.json" \
+  --provenance-out "$tmpdir/collision/relative/./card-data.json" \
+  >"$tmpdir/collision/relative.out" 2>"$tmpdir/collision/relative.err"; then
+  echo "expected relative output/provenance collision to fail" >&2
+  exit 1
+fi
+grep -Fq -- '--output and --provenance-out must be different paths' \
+  "$tmpdir/collision/relative.err"
+[[ ! -e "$tmpdir/collision/relative/card-data.json" ]]
+
+if ln -s relative "$tmpdir/collision/alias" 2>/dev/null; then
+  if "$ORACLE_GEN_BIN" "$tmpdir/default/data" \
+    --mtgjson "$tmpdir/corpus-b.json" \
+    --output "$tmpdir/collision/relative/card-data-symlink.json" \
+    --provenance-out "$tmpdir/collision/alias/card-data-symlink.json" \
+    >"$tmpdir/collision/symlink.out" 2>"$tmpdir/collision/symlink.err"; then
+    echo "expected symlink-equivalent output/provenance collision to fail" >&2
+    exit 1
+  fi
+  grep -Fq -- '--output and --provenance-out must be different paths' \
+    "$tmpdir/collision/symlink.err"
+  [[ ! -e "$tmpdir/collision/relative/card-data-symlink.json" ]]
+fi
+
 # J: a valid replacement card-data export with the old provenance is rejected.
 if cmp -s "$tmpdir/override/card-data.json" "$tmpdir/default/output/card-data.json"; then
   echo "fixture mutation did not change generated card-data bytes" >&2

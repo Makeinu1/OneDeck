@@ -1,7 +1,7 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fs::OpenOptions;
 use std::io::{self, Write};
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::process;
 use std::thread;
 
@@ -375,6 +375,62 @@ fn write_trace_report_atomic(path: &Path, report: &ParserTraceReport) -> io::Res
         let _ = std::fs::remove_file(&temp);
     }
     result
+}
+
+/// Make a path absolute without requiring the final destination to exist.
+fn absolute_path(path: &Path) -> io::Result<PathBuf> {
+    Ok(if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir()?.join(path)
+    })
+}
+
+/// Normalize a path lexically for the fallback case where its parent does not
+/// exist yet. Existing parents are canonicalized separately so symlink and
+/// `..` resolution follows the filesystem rather than string spelling.
+fn absolute_lexical_path(path: &Path) -> io::Result<PathBuf> {
+    let absolute = absolute_path(path)?;
+    let mut normalized = PathBuf::new();
+    for component in absolute.components() {
+        match component {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                normalized.pop();
+            }
+            component => normalized.push(component.as_os_str()),
+        }
+    }
+    Ok(normalized)
+}
+
+/// Resolve the filesystem destination represented by a path, including
+/// existing symlinks in the final path or its parent directories. If the final
+/// destination does not exist yet, canonicalize the existing parent and retain
+/// the final filename so normal new-file exports remain supported.
+fn destination_identity(path: &Path) -> io::Result<PathBuf> {
+    let absolute = absolute_path(path)?;
+    match std::fs::canonicalize(&absolute) {
+        Ok(canonical) => Ok(canonical),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            let parent = absolute.parent().unwrap_or_else(|| Path::new("."));
+            let file_name = absolute.file_name().ok_or_else(|| {
+                io::Error::new(io::ErrorKind::InvalidInput, "output path has no file name")
+            })?;
+            match std::fs::canonicalize(parent) {
+                Ok(canonical_parent) => Ok(canonical_parent.join(file_name)),
+                Err(parent_error) if parent_error.kind() == io::ErrorKind::NotFound => {
+                    absolute_lexical_path(&absolute)
+                }
+                Err(parent_error) => Err(parent_error),
+            }
+        }
+        Err(error) => Err(error),
+    }
+}
+
+fn output_paths_share_destination(left: &Path, right: &Path) -> io::Result<bool> {
+    Ok(destination_identity(left)? == destination_identity(right)?)
 }
 
 fn is_clean_signals(sig: &BracketSignals) -> bool {
@@ -1599,6 +1655,19 @@ fn main() {
     }
 
     let card_data_bytes = serde_json::to_vec(&face_index).expect("Failed to serialize card data");
+    if let (Some(output), Some(provenance_out)) = (&output, &provenance_out) {
+        match output_paths_share_destination(output, provenance_out) {
+            Ok(true) => {
+                eprintln!("Error: --output and --provenance-out must be different paths");
+                process::exit(2);
+            }
+            Ok(false) => {}
+            Err(error) => {
+                eprintln!("Error checking --output/--provenance-out paths: {error}");
+                process::exit(2);
+            }
+        }
+    }
     if let (Some(trace), Some(manifest)) = (&trace_args, trace_manifest) {
         if output.as_ref() == Some(&trace.output) {
             eprintln!("Error: --output and --parser-trace-out must be different paths");
@@ -1613,10 +1682,6 @@ fn main() {
             eprintln!("Error writing {}: {error}", trace.output.display());
             process::exit(2);
         });
-    }
-    if provenance_out.as_ref() == output.as_ref() && provenance_out.is_some() {
-        eprintln!("Error: --output and --provenance-out must be different paths");
-        process::exit(2);
     }
     if let Some(ref out_path) = output {
         std::fs::write(out_path, &card_data_bytes)
