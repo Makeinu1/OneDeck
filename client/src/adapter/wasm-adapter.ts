@@ -1607,6 +1607,7 @@ async function createMainThreadFallback(): Promise<MainThreadFallback> {
     getViewerSnapshot: (viewerId: number) =>
       enqueue(() => {
         const r = wasm.get_viewer_snapshot_js(viewerId);
+        if (typeof r === "string") throw new Error(r);
         if (r === null) throw new Error("NOT_INITIALIZED: get_viewer_snapshot_js returned null");
         return r as ViewerSnapshot;
       }),

@@ -530,6 +530,10 @@ self.onmessage = async (e: MessageEvent<EngineRequest>) => {
 
       case "getViewerSnapshot": {
         const r = get_viewer_snapshot_js(msg.viewerId);
+        if (typeof r === "string") {
+          error(msg.id, r);
+          break;
+        }
         if (r === null) {
           error(msg.id, "NOT_INITIALIZED: get_viewer_snapshot_js returned null");
           break;

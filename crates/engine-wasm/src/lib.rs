@@ -2401,6 +2401,13 @@ struct ViewerSnapshot<'a> {
     events: Option<Vec<GameEvent>>,
 }
 
+/// Reject viewer IDs that cannot be represented by the engine's `PlayerId`.
+fn viewer_player_id(player_id: u32) -> Result<PlayerId, String> {
+    u8::try_from(player_id)
+        .map(PlayerId)
+        .map_err(|_| format!("INVALID_VIEWER_ID: {player_id} exceeds u8 range"))
+}
+
 fn legal_actions_result_for_viewer(state: &GameState, viewer: PlayerId) -> LegalActionsResult {
     let (actions, spell_costs, legal_actions_by_object) = legal_actions_for_viewer(state, viewer);
     let auto_pass_recommended = auto_pass_recommended_for_viewer(state, viewer, &actions);
@@ -2486,6 +2493,16 @@ mod viewer_priority_tests {
             p2p.debug_permitted.is_empty(),
             "normal P2P must not receive the debug-library capability"
         );
+    }
+
+    #[test]
+    fn viewer_player_id_rejects_values_that_would_wrap() {
+        assert_eq!(
+            viewer_player_id(255).expect("u8 max is valid"),
+            PlayerId(255)
+        );
+        let error = viewer_player_id(256).expect_err("viewer IDs must not wrap to seat zero");
+        assert_eq!(error, "INVALID_VIEWER_ID: 256 exceeds u8 range");
     }
 
     #[test]
@@ -2679,9 +2696,12 @@ mod viewer_priority_tests {
 
 #[wasm_bindgen]
 pub fn get_viewer_snapshot_js(player_id: u32) -> JsValue {
+    let viewer = match viewer_player_id(player_id) {
+        Ok(viewer) => viewer,
+        Err(error) => return JsValue::from_str(&error),
+    };
     match with_state_mut(|state| {
         engine::game::layers::flush_layers(state);
-        let viewer = PlayerId(player_id as u8);
         let filtered = filter_state_for_viewer(state, viewer);
         let legal = legal_actions_result_for_viewer(state, viewer);
         let viewer_interaction =
@@ -2760,10 +2780,11 @@ pub fn get_viewer_transition_snapshot_js(player_id: u32, events: JsValue) -> JsV
             ))
         }
     };
-    match with_state_mut(|state| {
-        let viewer = PlayerId(player_id as u8);
-        to_js(&viewer_transition_snapshot(state, viewer, events))
-    }) {
+    let viewer = match viewer_player_id(player_id) {
+        Ok(viewer) => viewer,
+        Err(error) => return JsValue::from_str(&error),
+    };
+    match with_state_mut(|state| to_js(&viewer_transition_snapshot(state, viewer, events))) {
         Ok(val) => val,
         Err(_) => JsValue::NULL,
     }
