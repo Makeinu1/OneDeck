@@ -3270,6 +3270,28 @@ pub(crate) fn apply_face_down_entry_profile(
     }
 }
 
+/// CR 406.3 + CR 708.2a: a face-down profile is attached to the destination
+/// that created the intent. Replacement effects may rewrite the destination
+/// before delivery, but they must not carry a destination-specific marker into
+/// a different zone. Both the synchronous replacement path and the
+/// `ReplacementChoice` resume path call this same normalizer immediately before
+/// delivery so they cannot drift on this invariant.
+pub(crate) fn normalize_face_down_profile_for_destination(
+    event: &mut ProposedEvent,
+    intended_destination: Zone,
+) {
+    if let ProposedEvent::ZoneChange {
+        to,
+        face_down_profile,
+        ..
+    } = event
+    {
+        if *to != intended_destination {
+            *face_down_profile = None;
+        }
+    }
+}
+
 /// CR 730.3e (second clause) + CR 730.2d + CR 614.6: compute the card-component
 /// routing override for a merged permanent's leave.
 ///
@@ -4459,22 +4481,7 @@ fn execute_zone_move_with_applied_terminal(
     // `face_down_profile` is present.
     match replacement::replace_event(state, proposed, events) {
         ReplacementResult::Execute(mut event) => {
-            // A face-down profile is destination-specific. The parser uses the
-            // existing profile carrier as the intent for a face-down Exile
-            // search, while ordinary profiles describe a Battlefield entry.
-            // If a replacement changes the requested destination, the profile
-            // must not follow it and accidentally turn a redirected move into
-            // a face-down arrival in the wrong zone.
-            if let ProposedEvent::ZoneChange {
-                to,
-                face_down_profile,
-                ..
-            } = &mut event
-            {
-                if *to != dest_zone {
-                    *face_down_profile = None;
-                }
-            }
+            normalize_face_down_profile_for_destination(&mut event, dest_zone);
             let mut pending_aura_choice: Option<(PlayerId, ObjectId, Vec<TargetRef>)> = None;
             // CR 303.4g: set when the unhosted entrant came from the stack and so
             // must be put into its owner's graveyard rather than remain. Acted on
@@ -5554,11 +5561,239 @@ mod face_down_exile_entry_tests {
     use super::*;
     use crate::game::zones::create_object;
     use crate::types::ability::{
-        FaceDownProfile, FilterProp, StaticDefinition, TargetFilter, TypeFilter, TypedFilter,
+        AbilityDefinition, AbilityKind, FaceDownProfile, FilterProp, ReplacementDefinition,
+        StaticDefinition, TargetFilter, TypeFilter, TypedFilter,
     };
+    use crate::types::actions::GameAction;
     use crate::types::card_type::CoreType;
     use crate::types::identifiers::CardId;
+    use crate::types::replacements::ReplacementEvent;
     use crate::types::statics::StaticMode;
+
+    fn install_exile_redirect(state: &mut GameState, destination: Zone, name: &str) -> ObjectId {
+        let source = create_object(
+            state,
+            CardId(state.next_object_id),
+            PlayerId(0),
+            name.to_string(),
+            Zone::Battlefield,
+        );
+        state
+            .objects
+            .get_mut(&source)
+            .expect("replacement source exists")
+            .replacement_definitions
+            .push(
+                ReplacementDefinition::new(ReplacementEvent::Moved)
+                    .destination_zone(Zone::Exile)
+                    .description(name.to_string())
+                    .execute(AbilityDefinition::new(
+                        AbilityKind::Spell,
+                        Effect::ChangeZone {
+                            origin: None,
+                            destination,
+                            target: TargetFilter::Any,
+                            owner_library: false,
+                            enter_transformed: false,
+                            enters_under: None,
+                            enter_tapped: EtbTapState::Unspecified,
+                            enters_attacking: false,
+                            up_to: false,
+                            enter_with_counters: vec![],
+                            conditional_enter_with_counters: vec![],
+                            face_down_profile: None,
+                            enters_modified_if: None,
+                        },
+                    )),
+            );
+        source
+    }
+
+    fn make_real_library_creature(state: &mut GameState) -> (ObjectId, ObjectId) {
+        let source = create_object(
+            state,
+            CardId(state.next_object_id),
+            PlayerId(0),
+            "Face-down exile source".to_string(),
+            Zone::Battlefield,
+        );
+        let card = create_object(
+            state,
+            CardId(state.next_object_id),
+            PlayerId(0),
+            "Real five-five".to_string(),
+            Zone::Library,
+        );
+        let object = state.objects.get_mut(&card).expect("library card exists");
+        object.card_types.core_types = vec![CoreType::Creature];
+        object.base_card_types = object.card_types.clone();
+        object.power = Some(5);
+        object.toughness = Some(5);
+        object.base_power = Some(5);
+        object.base_toughness = Some(5);
+        (source, card)
+    }
+
+    /// CR 406.3 + CR 616.1: a Library → face-down Exile move that parks on a
+    /// material replacement choice must clear the Exile-only profile when the
+    /// selected replacement redirects the card to the battlefield. This drives
+    /// the real `move_object` → `ReplacementChoice` → `ChooseReplacement` →
+    /// `deliver_replaced_zone_change` path. Before the resume normalizer, the
+    /// stale profile makes the card a face-down vanilla 2/2; the assertions on
+    /// both characteristics and the public final event are deliberately
+    /// non-vacuous.
+    #[test]
+    fn face_down_exile_replacement_choice_redirect_clears_exile_profile() {
+        use crate::game::engine::apply_as_current;
+
+        let mut state = GameState::new_two_player(42);
+        let (source, card) = make_real_library_creature(&mut state);
+        let battlefield_redirect = install_exile_redirect(
+            &mut state,
+            Zone::Battlefield,
+            "Redirect face-down Exile to battlefield",
+        );
+        let _hand_redirect =
+            install_exile_redirect(&mut state, Zone::Hand, "Redirect face-down Exile to hand");
+
+        let mut events = Vec::new();
+        let result = move_object(
+            &mut state,
+            ZoneMoveRequest::effect(card, Zone::Exile, source)
+                .face_down(FaceDownProfile::face_down_exile_marker()),
+            &mut events,
+        );
+        let ZoneMoveResult::NeedsChoice(chooser) = result else {
+            panic!("expected a material replacement choice");
+        };
+        let WaitingFor::ReplacementChoice { candidates, .. } = state.waiting_for.clone() else {
+            panic!("expected ReplacementChoice, got {:?}", state.waiting_for);
+        };
+        let choice = candidates
+            .iter()
+            .position(|candidate| candidate.source_id == battlefield_redirect)
+            .expect("battlefield redirect must be offered as a choice");
+        state.priority_player = chooser;
+        let resumed = apply_as_current(&mut state, GameAction::ChooseReplacement { index: choice })
+            .expect("resume replacement choice");
+
+        let object = &state.objects[&card];
+        assert_eq!(object.zone, Zone::Battlefield);
+        assert!(
+            !object.face_down,
+            "the Exile-only marker must not morph a redirect"
+        );
+        assert_eq!(object.power, Some(5));
+        assert_eq!(object.toughness, Some(5));
+        assert!(resumed.events.iter().any(|event| {
+            matches!(
+                event,
+                GameEvent::ZoneChanged {
+                    object_id,
+                    from: Some(Zone::Library),
+                    to: Zone::Battlefield,
+                    record,
+                } if *object_id == card && record.name == "Real five-five"
+            )
+        }));
+        let opponent_events =
+            crate::game::visibility::filter_events_for_viewer(&resumed.events, &state, PlayerId(1));
+        assert!(
+            opponent_events.iter().any(|event| {
+                matches!(
+                    event,
+                    GameEvent::ZoneChanged {
+                        object_id,
+                        from: Some(Zone::Library),
+                        to: Zone::Battlefield,
+                        record,
+                    } if *object_id == card && record.name == "Real five-five"
+                )
+            }),
+            "a redirected face-up battlefield arrival is public after the marker is cleared"
+        );
+    }
+
+    /// CR 406.3: the already-correct synchronous replacement branch keeps the
+    /// same destination-specific normalization when no player choice is needed.
+    #[test]
+    fn face_down_exile_synchronous_redirect_clears_exile_profile() {
+        let mut state = GameState::new_two_player(42);
+        let (source, card) = make_real_library_creature(&mut state);
+        install_exile_redirect(
+            &mut state,
+            Zone::Battlefield,
+            "Synchronous battlefield redirect",
+        );
+
+        let mut events = Vec::new();
+        let result = move_object(
+            &mut state,
+            ZoneMoveRequest::effect(card, Zone::Exile, source)
+                .face_down(FaceDownProfile::face_down_exile_marker()),
+            &mut events,
+        );
+
+        assert!(matches!(result, ZoneMoveResult::Done));
+        let object = &state.objects[&card];
+        assert_eq!(object.zone, Zone::Battlefield);
+        assert!(!object.face_down);
+        assert_eq!(object.power, Some(5));
+        assert_eq!(object.toughness, Some(5));
+    }
+
+    /// CR 406.3: a replacement that leaves the final destination at Exile must
+    /// preserve the face-down marker and its event-time concealment.
+    #[test]
+    fn face_down_exile_same_destination_preserves_marker_and_hides_event() {
+        let mut state = GameState::new_two_player(42);
+        let (source, card) = make_real_library_creature(&mut state);
+        install_exile_redirect(
+            &mut state,
+            Zone::Exile,
+            "Same-destination Exile replacement",
+        );
+
+        let mut events = Vec::new();
+        let result = move_object(
+            &mut state,
+            ZoneMoveRequest::effect(card, Zone::Exile, source)
+                .face_down(FaceDownProfile::face_down_exile_marker()),
+            &mut events,
+        );
+
+        assert!(matches!(result, ZoneMoveResult::Done));
+        assert_eq!(state.objects[&card].zone, Zone::Exile);
+        assert!(state.objects[&card].face_down);
+        assert!(events.iter().any(|event| {
+            matches!(
+                event,
+                GameEvent::ZoneChanged {
+                    object_id,
+                    from: Some(Zone::Library),
+                    to: Zone::Exile,
+                    record,
+                } if *object_id == card
+                    && record
+                        .trigger_source_context()
+                        .is_some_and(|context| context.face_down)
+            )
+        }));
+        assert!(
+            crate::game::visibility::filter_events_for_viewer(&events, &state, PlayerId(1))
+                .iter()
+                .all(|event| !matches!(
+                    event,
+                    GameEvent::ZoneChanged {
+                        object_id,
+                        from: Some(Zone::Library),
+                        to: Zone::Exile,
+                        ..
+                    } if *object_id == card
+                )),
+            "the preserved face-down Exile marker must remain hidden from an opponent"
+        );
+    }
 
     /// CR 708.2a + CR 400.4a + CR 400.7: a NON-permanent (instant/sorcery) card
     /// put onto the battlefield face down from EXILE must still enter as a

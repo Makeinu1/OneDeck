@@ -316,6 +316,23 @@ fn handle_replacement_choice_inner(
     // pre-move incarnation and the exact proposed event. Capture this before
     // `continue_replacement` consumes the pending record.
     let parked_zone_change_delivery = state.pending_zone_change_delivery_from_replacement();
+    // CR 406.3: preserve the original destination that created a face-down
+    // marker while the replacement choice is parked. The selected replacement
+    // may rewrite `pending.proposed.to` before the resumed event reaches the
+    // delivery seam, so the final destination must be compared with this
+    // latched intent rather than with the already-rewritten event.
+    let parked_face_down_intended_destination =
+        state
+            .pending_replacement
+            .as_ref()
+            .and_then(|pending| match pending.proposed {
+                ProposedEvent::ZoneChange {
+                    to,
+                    face_down_profile: Some(_),
+                    ..
+                } => Some(to),
+                _ => None,
+            });
     let result = super::replacement::continue_replacement(state, index, events);
     // CR 614.12a: an optional `MayCost` accept whose payment surfaced an
     // interactive sub-choice (e.g. Mox Diamond's "discard a land card" with
@@ -363,6 +380,13 @@ fn handle_replacement_choice_inner(
                 //     is restored structurally inside the shared delivery for
                 //     `Stack → Battlefield` events (`CastLinkSnapshot`).
                 event @ ProposedEvent::ZoneChange { .. } => {
+                    let mut event = event;
+                    if let Some(intended_destination) = parked_face_down_intended_destination {
+                        crate::game::zone_pipeline::normalize_face_down_profile_for_destination(
+                            &mut event,
+                            intended_destination,
+                        );
+                    }
                     let (object_id, to, cause, discard_frame) = match &event {
                         ProposedEvent::ZoneChange {
                             object_id,
