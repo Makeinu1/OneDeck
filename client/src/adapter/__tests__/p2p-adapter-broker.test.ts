@@ -40,7 +40,17 @@ vi.mock("../../network/protocol", async (orig) => {
 });
 
 
-const mocks = vi.hoisted(() => ({
+const mocks = vi.hoisted(() => {
+  const getViewerSnapshot = vi.fn(async (pid: number) => ({
+    state: { filteredFor: pid },
+    actions: [],
+    autoPassRecommended: false,
+  }));
+  const getViewerTransitionSnapshot = vi.fn(async (pid: number, events: unknown[]) => ({
+    ...(await getViewerSnapshot(pid)),
+    events: events.slice(),
+  }));
+  return {
   initializeMultiplayerHostGame: vi.fn(async () => ({ events: [] })),
   getLegalActions: vi.fn(async () => ({
     actions: [],
@@ -51,11 +61,8 @@ const mocks = vi.hoisted(() => ({
     autoPassRecommended: false,
   })),
   getFilteredState: vi.fn(async (pid: number) => ({ filteredFor: pid })),
-  getViewerSnapshot: vi.fn(async (pid: number) => ({
-    state: { filteredFor: pid },
-    actions: [],
-    autoPassRecommended: false,
-  })),
+  getViewerSnapshot,
+  getViewerTransitionSnapshot,
   projectSeatView: vi.fn(async (stateJson: string) => {
     const state = JSON.parse(stateJson) as {
       seats: Array<{ type: string }>;
@@ -70,7 +77,8 @@ const mocks = vi.hoisted(() => ({
     };
   }),
   setMultiplayerMode: vi.fn(async (_enabled: boolean) => undefined),
-}));
+  };
+});
 
 // Mirrors `p2p-adapter-multiplayer.test.ts`: the host acquires its engine via
 // `getHostAdapter()`, and teardown goes through `releaseHostSession()`.
@@ -84,6 +92,7 @@ vi.mock("../wasm-adapter", () => {
     getLegalActionsForViewer: mocks.getLegalActionsForViewer,
     getFilteredState: mocks.getFilteredState,
     getViewerSnapshot: mocks.getViewerSnapshot,
+    getViewerTransitionSnapshot: mocks.getViewerTransitionSnapshot,
     projectSeatView: mocks.projectSeatView,
     setMultiplayerMode: mocks.setMultiplayerMode,
     releaseHostSession: vi.fn(async (_claimed: boolean) => undefined),

@@ -32,15 +32,17 @@ use engine::game::deck_validation::{draft_set_concessions_for, evaluate_deck_for
 use engine::game::CardDbRehydrationFinalization;
 use engine::game::{
     can_pair_commanders, companion_candidates, deck_copy_limit_for, estimate_bracket,
-    evaluate_deck_compatibility, filter_state_for_viewer, is_brawl_commander_eligible,
-    is_commander_eligible, is_freeform_commander_eligible, is_tiny_leader_eligible,
-    load_and_hydrate_decks, max_deck_copies, rehydrate_game_from_card_db_with_finalization,
-    resolve_deck_list, signature_spell_selection_policy, start_game,
-    start_game_with_starting_player, validate_name_deck_for_format_full, BracketEstimate,
-    DeckCompatibilityRequest, DeckList, PlayerDeckList, ReplayPlayer,
+    evaluate_deck_compatibility, filter_events_for_viewer, filter_state_for_viewer,
+    is_brawl_commander_eligible, is_commander_eligible, is_freeform_commander_eligible,
+    is_tiny_leader_eligible, load_and_hydrate_decks, max_deck_copies,
+    rehydrate_game_from_card_db_with_finalization, resolve_deck_list,
+    signature_spell_selection_policy, start_game, start_game_with_starting_player,
+    validate_name_deck_for_format_full, BracketEstimate, DeckCompatibilityRequest, DeckList,
+    PlayerDeckList, ReplayPlayer,
 };
 use engine::types::actions::{DebugAction, DebugCardCreationKind};
 use engine::types::custom_format::{CustomFormatDef, CustomFormatRules};
+use engine::types::events::GameEvent;
 use engine::types::format::{
     validate_starting_life_bounds, DeckCopyLimit, FormatConfig, GameFormat,
 };
@@ -2393,6 +2395,18 @@ struct ViewerSnapshot<'a> {
     #[serde(skip_serializing_if = "Option::is_none")]
     stuck_diagnostic: Option<engine::ai_support::StuckDecisionDiagnostic>,
     viewer_interaction: engine::types::interaction::ViewerInteraction,
+    /// Events projected through the engine's viewer-visibility authority.
+    /// Absent for the legacy state-only snapshot endpoint.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    events: Option<Vec<GameEvent>>,
+}
+
+fn filter_transition_events_for_viewer(
+    events: &[GameEvent],
+    state: &GameState,
+    viewer: PlayerId,
+) -> Vec<GameEvent> {
+    filter_events_for_viewer(events, state, viewer)
 }
 
 fn legal_actions_result_for_viewer(state: &GameState, viewer: PlayerId) -> LegalActionsResult {
@@ -2481,6 +2495,25 @@ mod viewer_priority_tests {
             "normal P2P must not receive the debug-library capability"
         );
     }
+
+    #[test]
+    fn transition_projection_uses_engine_event_visibility_authority() {
+        let state = GameState::new_two_player(42);
+        let event = GameEvent::CardDrawn {
+            player_id: PlayerId(0),
+            object_id: ObjectId(99),
+            nth_in_turn: 1,
+            nth_in_step: 1,
+        };
+
+        assert!(
+            filter_transition_events_for_viewer(&[event.clone()], &state, PlayerId(1)).is_empty()
+        );
+        assert_eq!(
+            filter_transition_events_for_viewer(&[event.clone()], &state, PlayerId(0)),
+            vec![event]
+        );
+    }
 }
 
 #[wasm_bindgen]
@@ -2507,6 +2540,50 @@ pub fn get_viewer_snapshot_js(player_id: u32) -> JsValue {
             activation_block_reasons: legal.activation_block_reasons,
             stuck_diagnostic: legal.stuck_diagnostic,
             viewer_interaction,
+            events: None,
+        })
+    }) {
+        Ok(val) => val,
+        Err(_) => JsValue::NULL,
+    }
+}
+
+/// Combined viewer-scoped transition projection used by browser-host P2P.
+///
+/// State, legal actions, interaction authority, and transition events are
+/// derived from the same engine read so the transport cannot pair a filtered
+/// state with raw hidden-information events. The event visibility rules remain
+/// owned by `engine::game::visibility`; TypeScript only transports the result.
+#[wasm_bindgen]
+pub fn get_viewer_transition_snapshot_js(player_id: u32, events: JsValue) -> JsValue {
+    let events: Vec<GameEvent> = match serde_wasm_bindgen::from_value(events) {
+        Ok(events) => events,
+        Err(_) => return JsValue::NULL,
+    };
+    match with_state_mut(|state| {
+        engine::game::layers::flush_layers(state);
+        let viewer = PlayerId(player_id as u8);
+        let filtered = filter_state_for_viewer(state, viewer);
+        let legal = legal_actions_result_for_viewer(state, viewer);
+        let viewer_interaction =
+            engine::game::interaction::derive_viewer_interaction(state, &filtered, viewer);
+        let filtered_events = filter_transition_events_for_viewer(&events, state, viewer);
+        to_js(&ViewerSnapshot {
+            state: engine::game::derived_views::ClientGameStateRef::wrap_filtered(
+                state,
+                &filtered,
+                Some(viewer),
+            ),
+            actions: legal.actions,
+            auto_pass_recommended: legal.auto_pass_recommended,
+            end_continuous_effect_offers: legal.end_continuous_effect_offers,
+            mana_payment_shortcut_actions: legal.mana_payment_shortcut_actions,
+            spell_costs: legal.spell_costs,
+            legal_actions_by_object: legal.legal_actions_by_object,
+            activation_block_reasons: legal.activation_block_reasons,
+            stuck_diagnostic: legal.stuck_diagnostic,
+            viewer_interaction,
+            events: Some(filtered_events),
         })
     }) {
         Ok(val) => val,

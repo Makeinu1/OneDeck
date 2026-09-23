@@ -110,10 +110,19 @@ const mocks = vi.hoisted(() => {
   // can't call the adapter module's `nextSnapshotSeq`. Only ordering matters
   // to these assertions, and `seq` is never compared across clients.
   let seq = 0;
+  const getViewerSnapshot = vi.fn(async (pid: number) => ({
+    state: { filteredFor: pid, players: [] },
+    actions: [],
+    autoPassRecommended: false,
+  }));
+  const getViewerTransitionSnapshot = vi.fn(async (pid: number, events: unknown[]) => ({
+    ...(await getViewerSnapshot(pid)),
+    events: events.slice(),
+  }));
   return {
     initialize: vi.fn(async () => undefined),
-    submitAction: vi.fn(async (_action: unknown) => ({ events: [] })),
-    submitInteraction: vi.fn(async (_submission: unknown) => ({ events: [] })),
+    submitAction: vi.fn(async (_action: unknown) => ({ events: [] as GameEvent[] })),
+    submitInteraction: vi.fn(async (_submission: unknown) => ({ events: [] as GameEvent[] })),
     previewInteraction: vi.fn(async (request: { requestId: string }, _actor: number) => ({
       requestId: request.requestId,
       interactionId: "interaction-1",
@@ -145,11 +154,8 @@ const mocks = vi.hoisted(() => {
       filteredFor: pid,
       players: [],
     })),
-    getViewerSnapshot: vi.fn(async (pid: number) => ({
-      state: { filteredFor: pid, players: [] },
-      actions: [],
-      autoPassRecommended: false,
-    })),
+    getViewerSnapshot,
+    getViewerTransitionSnapshot,
     getAiActionProposal: vi.fn(async (_difficulty: string, _playerId: number) => null),
     submitAiActionProposal: vi.fn(async () => ({
       status: "applied",
@@ -222,7 +228,7 @@ const mocks = vi.hoisted(() => {
      * the multiplayer flag in this one call. Default "the engine accepted" — a
      * real engine with nothing installed answers the same way.
      */
-    initializeMultiplayerHostGame: vi.fn(async () => ({ events: [] })),
+    initializeMultiplayerHostGame: vi.fn(async () => ({ events: [] as GameEvent[] })),
     setMultiplayerMode: vi.fn(async (_enabled: boolean) => undefined),
     /**
      * Replaces the bare `dispose()` the host used to call on its engine.
@@ -269,6 +275,7 @@ const mockCheckDeckCompatibility = mocks.checkDeckCompatibility;
 const mockEvaluateDeckFormatGate = mocks.evaluateDeckFormatGate;
 const mockGetSnapshot = mocks.getSnapshot as unknown as AsyncMockWithResolvedValueOnce;
 const mockGetViewerSnapshot = mocks.getViewerSnapshot;
+const mockGetViewerTransitionSnapshot = mocks.getViewerTransitionSnapshot;
 const mockInitializeHostGame = mocks.initializeMultiplayerHostGame;
 const mockSetMultiplayerMode = mocks.setMultiplayerMode;
 const mockProjectSeatView = mocks.projectSeatView;
@@ -358,6 +365,7 @@ vi.mock("../wasm-adapter", () => {
     getLegalActionsForViewer: mocks.getLegalActionsForViewer,
     getFilteredState: mocks.getFilteredState,
     getViewerSnapshot: mocks.getViewerSnapshot,
+    getViewerTransitionSnapshot: mocks.getViewerTransitionSnapshot,
     getAiActionProposal: mocks.getAiActionProposal,
     submitAiActionProposal: mocks.submitAiActionProposal,
     exportPersistenceState: mocks.exportPersistenceState,
@@ -390,6 +398,7 @@ beforeEach(() => {
   mockCheckDeckCompatibility.mockClear();
   mockEvaluateDeckFormatGate.mockClear();
   mockGetViewerSnapshot.mockClear();
+  mockGetViewerTransitionSnapshot.mockClear();
   mockSetMultiplayerMode.mockClear();
   mockProjectSeatView.mockClear();
   mockGetState.mockClear();
@@ -2094,6 +2103,52 @@ describe("P2PHostAdapter — 3-4p multiplayer", () => {
     expect(mockGetViewerSnapshot).toHaveBeenCalledTimes(2);
     expect(mockGetViewerSnapshot).toHaveBeenCalledWith(1);
     expect(mockGetViewerSnapshot).toHaveBeenCalledWith(2);
+  });
+
+  it("uses the engine-projected events for setup and state updates", async () => {
+    const rawEvent: GameEvent = {
+      type: "CardDrawn",
+      data: { player_id: 0, object_id: 99, nth_in_turn: 1, nth_in_step: 1 },
+    };
+    const projectedEvent: GameEvent = {
+      type: "CardsDrawn",
+      data: { player_id: 0, count: 1 },
+    };
+    const projectedSnapshot = async (pid: number) => ({
+      ...(await mocks.getViewerSnapshot(pid)),
+      events: [projectedEvent],
+    });
+    mockInitializeHostGame.mockResolvedValueOnce({ events: [rawEvent] });
+    mockSubmitAction.mockResolvedValueOnce({ events: [rawEvent] });
+    mockGetViewerTransitionSnapshot
+      .mockImplementationOnce(projectedSnapshot)
+      .mockImplementationOnce(projectedSnapshot);
+
+    const { adapter, emitConnection } = makeHost(2);
+    await adapter.initialize();
+    const guest = await joinGuest(emitConnection, {
+      type: "guest_deck",
+      deckData: { player: { main_deck: [], sideboard: [] } },
+    });
+
+    await adapter.initializeGame();
+    const setup = (await guest.getSentMessages()).find(
+      (message): message is P2PMessage & { type: "game_setup" } =>
+        typeof message === "object" && message !== null && (message as { type?: string }).type === "game_setup",
+    );
+    expect(setup?.events).toEqual([projectedEvent]);
+
+    guest.sent.length = 0;
+    await adapter.submitAction({ type: "PassPriority" }, 0);
+    const update = (await guest.getSentMessages()).find(
+      (message): message is P2PMessage & { type: "state_update" } =>
+        typeof message === "object" && message !== null && (message as { type?: string }).type === "state_update",
+    );
+    expect(update?.events).toEqual([projectedEvent]);
+    expect(update?.events).not.toEqual([rawEvent]);
+    expect(mockGetViewerTransitionSnapshot).toHaveBeenNthCalledWith(1, 1, [rawEvent]);
+    expect(mockGetViewerTransitionSnapshot).toHaveBeenNthCalledWith(2, 1, [rawEvent]);
+    adapter.dispose();
   });
 
   const isStateBearingWithRevision = (m: unknown): m is P2PMessage & { revision: number } =>

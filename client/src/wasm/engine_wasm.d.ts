@@ -333,6 +333,7 @@ export function get_legal_actions_js(): any;
 export function get_stack_pressure(): any;
 
 export function get_viewer_snapshot_js(player_id: number): any;
+export function get_viewer_transition_snapshot_js(player_id: number, events: any): any;
 
 /**
  * Whether the current game has an in-progress replay recording. `false`
@@ -724,6 +725,7 @@ export interface InitOutput {
     readonly get_filtered_game_state: (a: number) => any;
     readonly get_legal_actions_for_viewer_js: (a: number) => any;
     readonly get_viewer_snapshot_js: (a: number) => any;
+    readonly get_viewer_transition_snapshot_js: (a: number, b: any) => any;
     readonly has_replay_recording: () => number;
     readonly initialize_game: (a: any, b: number, c: number, d: any, e: any, f: number, g: number) => any;
     readonly initialize_multiplayer_host_game: (a: any, b: number, c: number, d: any, e: any, f: number, g: number) => any;

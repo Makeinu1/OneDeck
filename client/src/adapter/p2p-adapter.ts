@@ -2311,7 +2311,7 @@ export class P2PHostAdapter implements EngineAdapter {
       for (const [pid, session] of this.guestSessions) {
         const token = this.playerTokens.get(pid)!;
         try {
-          const snapshot = await this.wasm.getViewerSnapshot(pid);
+          const snapshot = await this.wasm.getViewerTransitionSnapshot(pid, result.events);
           void this.send(session, {
             type: "game_setup",
             wireProtocolVersion: WIRE_PROTOCOL_VERSION,
@@ -2319,7 +2319,7 @@ export class P2PHostAdapter implements EngineAdapter {
             playerToken: token,
             revision,
             state: snapshot.state,
-            events: result.events,
+            events: snapshot.events,
             playerNames: allNames,
             ...legalActionsToWire(snapshot),
           }).then((accepted) => {
@@ -2657,12 +2657,12 @@ export class P2PHostAdapter implements EngineAdapter {
     for (const [pid, session] of this.guestSessions) {
       if (this.disconnectedSeats.has(pid)) continue;
       try {
-        const snapshot = await this.wasm.getViewerSnapshot(pid);
+        const snapshot = await this.wasm.getViewerTransitionSnapshot(pid, events);
         sends.push(this.send(session, {
           type: "state_update",
           revision,
           state: snapshot.state,
-          events,
+          events: snapshot.events,
           logEntries,
           ...legalActionsToWire(snapshot),
         }));
