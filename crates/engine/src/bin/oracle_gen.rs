@@ -7,6 +7,7 @@ use std::thread;
 
 use serde::{Deserialize, Serialize};
 
+use engine::database::card_data_provenance::CardDataProvenance;
 use engine::database::legality::{legalities_to_export_map, normalize_legalities};
 use engine::database::mtgjson::{
     load_atomic_cards, load_card_types, AtomicCard, Ruling, SetCard, SetFile,
@@ -1239,6 +1240,7 @@ fn main() {
     let mut mtgjson_override: Option<PathBuf> = None;
     let mut names_out: Option<PathBuf> = None;
     let mut output: Option<PathBuf> = None;
+    let mut provenance_out: Option<PathBuf> = None;
     let mut sidecar_dir: Option<PathBuf> = None;
     let mut stats = false;
     let mut write_subtypes = false;
@@ -1272,6 +1274,14 @@ fn main() {
                     process::exit(1);
                 }
                 output = Some(PathBuf::from(&args[i]));
+            }
+            "--provenance-out" => {
+                i += 1;
+                if i >= args.len() {
+                    eprintln!("Error: --provenance-out requires a path argument");
+                    process::exit(1);
+                }
+                provenance_out = Some(PathBuf::from(&args[i]));
             }
             "--sidecar-dir" => {
                 i += 1;
@@ -1326,10 +1336,13 @@ fn main() {
             Some(d) => d.join("mtgjson/AtomicCards.json"),
             None => {
                 eprintln!(
-                    "Usage: oracle-gen <data-dir> [--mtgjson <path>] [--stats] [--output <path>]"
+                    "Usage: oracle-gen <data-dir> [--mtgjson <path>] [--stats] [--output <path>] [--provenance-out <path>]"
                 );
                 eprintln!("  Parses Oracle text from MTGJSON and outputs card-data export JSON");
                 eprintln!("  --output <path>  Write the export to a file instead of stdout");
+                eprintln!(
+                    "  --provenance-out <path>  Write the exact source/output hashes for the export"
+                );
                 eprintln!(
                     "  --write-subtypes Regenerate the committed creature-subtype vocabulary\n\
                      \x20                 (crates/engine/data/oracle-subtypes.json). Requires\n\
@@ -1353,6 +1366,13 @@ fn main() {
         eprintln!("Error: {} not found", mtgjson_path.display());
         process::exit(1);
     }
+
+    let source_corpus_sha256 = std::fs::read(&mtgjson_path)
+        .map(|bytes| sha256_bytes(&bytes))
+        .unwrap_or_else(|error| {
+            eprintln!("Error reading {}: {error}", mtgjson_path.display());
+            process::exit(1);
+        });
 
     let atomic = match load_atomic_cards(&mtgjson_path) {
         Ok(a) => a,
@@ -1578,14 +1598,14 @@ fn main() {
         );
     }
 
-    let json = serde_json::to_string(&face_index).expect("Failed to serialize card data");
+    let card_data_bytes = serde_json::to_vec(&face_index).expect("Failed to serialize card data");
     if let (Some(trace), Some(manifest)) = (&trace_args, trace_manifest) {
         if output.as_ref() == Some(&trace.output) {
             eprintln!("Error: --output and --parser-trace-out must be different paths");
             process::exit(2);
         }
         let report =
-            build_trace_report(&face_index, manifest, json.as_bytes()).unwrap_or_else(|error| {
+            build_trace_report(&face_index, manifest, &card_data_bytes).unwrap_or_else(|error| {
                 eprintln!("Error building parser trace report: {error}");
                 process::exit(2);
             });
@@ -1594,11 +1614,35 @@ fn main() {
             process::exit(2);
         });
     }
+    if provenance_out.as_ref() == output.as_ref() && provenance_out.is_some() {
+        eprintln!("Error: --output and --provenance-out must be different paths");
+        process::exit(2);
+    }
     if let Some(ref out_path) = output {
-        std::fs::write(out_path, &json)
+        std::fs::write(out_path, &card_data_bytes)
             .unwrap_or_else(|e| panic!("Failed to write {}: {e}", out_path.display()));
     } else {
-        println!("{json}");
+        io::stdout()
+            .write_all(&card_data_bytes)
+            .unwrap_or_else(|e| panic!("Failed to write card data to stdout: {e}"));
+    }
+
+    let provenance_path = match provenance_out {
+        Some(path) => Some(path),
+        None if output.is_none() => data_dir
+            .as_ref()
+            .map(|dir| dir.join("card-data.provenance.json")),
+        None => None,
+    };
+    if let Some(path) = provenance_path {
+        let provenance = CardDataProvenance {
+            source_corpus_sha256,
+            card_data_sha256: sha256_bytes(&card_data_bytes),
+        };
+        provenance.write_atomic(&path).unwrap_or_else(|error| {
+            eprintln!("Error writing {}: {error}", path.display());
+            process::exit(1);
+        });
     }
 
     // Emit per-locale content-i18n sidecars (card-data.<code>.json) into the
