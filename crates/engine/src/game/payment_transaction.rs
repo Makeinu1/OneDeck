@@ -273,12 +273,19 @@ pub(crate) fn project(state: &GameState) -> GameState {
 /// Materialize the canonical, uncommitted base for an unscoped client wire.
 ///
 /// A `ClientGameStateRef` without a viewer has no authenticated actor and must
-/// never replay a staged transaction merely to serialize it. The canonical
-/// state already carries the public `WaitingFor` prompt; clear only the
-/// server-only descriptor and transient replay flags. Trusted internal callers
-/// that need the full shadow use [`project`] directly and do not cross the
-/// client serialization boundary.
+/// never replay a staged transaction merely to serialize it. Route the
+/// canonical base through the existing non-seat spectator projection so hidden
+/// identities and private continuation carriers are redacted by the shared
+/// visibility authority while the public `WaitingFor` remains usable. Trusted
+/// internal callers that need the full shadow use [`project`] directly and do
+/// not cross the client serialization boundary.
 pub(crate) fn project_without_viewer(state: &GameState) -> GameState {
+    if state.payment_transaction.is_some() {
+        return crate::game::visibility::filter_state_for_viewer(
+            state,
+            crate::types::player::PlayerId(u8::MAX),
+        );
+    }
     let mut base = state.clone();
     base.payment_transaction = None;
     base.payment_transaction_replay = false;
@@ -318,10 +325,36 @@ pub(crate) fn project_for_viewer(
     base
 }
 
+/// Retire a staged payment when its payer/root owner leaves the game.
+///
+/// CR 800.4a removes a leaving player's paused resolution authority along with
+/// the player. The canonical base remains live for the elimination sweep; only
+/// the durable payment descriptor and its transient replay guards are retired.
+/// An unrelated player's departure must not cancel another player's payment.
+pub(crate) fn abandon_for_owner_departure(
+    state: &mut GameState,
+    departing: crate::types::player::PlayerId,
+) {
+    if state
+        .payment_transaction
+        .as_ref()
+        .is_some_and(|transaction| transaction.owner == departing)
+    {
+        state.payment_transaction = None;
+        state.payment_transaction_replay = false;
+        state.payment_transaction_just_handled = false;
+    }
+}
+
 /// Whether the transaction path should own this action. Actor-scoped display
 /// preferences remain ordinary reducer actions while a payment prompt is open.
 pub(crate) fn owns_action(state: &GameState, action: &GameAction) -> bool {
-    state.payment_transaction.is_some() && !action.is_actor_scoped_preference()
+    state.payment_transaction.is_some()
+        && !action.is_actor_scoped_preference()
+        // CR 104.3a: concession bypasses every WaitingFor, so it must reach
+        // the canonical elimination authority instead of entering the payment
+        // transcript as if it were a payment choice.
+        && !matches!(action, GameAction::Concede { .. })
 }
 
 #[cfg(test)]
@@ -887,7 +920,11 @@ mod tests {
         );
         assert_eq!(
             unscoped_wire["state"]["objects"][hidden_card.0.to_string()]["name"],
-            "R5 hidden shadow card"
+            "Hidden Card"
+        );
+        assert!(
+            !unscoped_wire.to_string().contains("R5 hidden shadow card"),
+            "unscoped wire leaked hidden identity: {unscoped_wire}"
         );
         assert!(unscoped_wire["state"].get("payment_transaction").is_none());
 
@@ -921,6 +958,20 @@ mod tests {
             crate::types::game_state::WaitingFor::ChooseOneOfBranch { .. }
         ));
         assert_eq!(controlled.objects[&controlled_card].zone, Zone::Hand);
+        let unscoped_controlled_wire = serde_json::to_value(
+            crate::game::derived_views::ClientGameStateRef::wrap(&controlled, None),
+        )
+        .expect("unscoped controlled wire projection");
+        assert!(!unscoped_controlled_wire
+            .to_string()
+            .contains("R5 controller-hidden card"));
+        assert!(matches!(
+            serde_json::from_value::<crate::types::game_state::WaitingFor>(
+                unscoped_controlled_wire["state"]["waiting_for"].clone()
+            )
+            .expect("public waiting prompt remains decodable"),
+            crate::types::game_state::WaitingFor::ChooseOneOfBranch { .. }
+        ));
         let semantic_view =
             crate::game::visibility::filter_state_for_viewer(&controlled, PlayerId(0));
         let controller_view =
@@ -981,6 +1032,44 @@ mod tests {
             controlled.waiting_for,
             crate::types::game_state::WaitingFor::Priority { .. }
         ));
+
+        // CR 104.3a + CR 800.4a: Concede bypasses the staged-payment
+        // transcript and retires only when the payment owner leaves. The
+        // two-player fixture reaches the active choice first, then the owner
+        // concedes through the public boundary and the normal elimination
+        // authority terminalizes the game without publishing payment events.
+        let (mut concede, concede_root, _) = controlled_discard_phyrexian_case();
+        let mut concede_setup_events = Vec::new();
+        effects::resolve_ability_chain(&mut concede, &concede_root, &mut concede_setup_events, 0)
+            .expect("concession witness reaches a staged payment prompt");
+        let transaction_owner = concede
+            .payment_transaction
+            .as_ref()
+            .expect("concession witness must be staged before Concede")
+            .owner;
+        assert_eq!(transaction_owner, PlayerId(0));
+        assert!(!owns_action(
+            &concede,
+            &GameAction::Concede {
+                player_id: transaction_owner,
+            }
+        ));
+        let concede_result = crate::game::engine::apply_as_current(
+            &mut concede,
+            GameAction::Concede {
+                player_id: transaction_owner,
+            },
+        )
+        .expect("Concede bypasses the active payment prompt");
+        assert!(concede.payment_transaction.is_none());
+        assert!(matches!(
+            concede.waiting_for,
+            crate::types::game_state::WaitingFor::GameOver { .. }
+        ));
+        assert!(!concede_result.events.iter().any(|event| matches!(
+            event,
+            GameEvent::LifeChanged { .. } | GameEvent::EnergyChanged { .. }
+        )));
 
         // Descriptor persistence is canonical+transcript only. Viewer and wire
         // projections materialize the public shadow and never expose the root.
