@@ -270,6 +270,22 @@ pub(crate) fn project(state: &GameState) -> GameState {
     }
 }
 
+/// Materialize the canonical, uncommitted base for an unscoped client wire.
+///
+/// A `ClientGameStateRef` without a viewer has no authenticated actor and must
+/// never replay a staged transaction merely to serialize it. The canonical
+/// state already carries the public `WaitingFor` prompt; clear only the
+/// server-only descriptor and transient replay flags. Trusted internal callers
+/// that need the full shadow use [`project`] directly and do not cross the
+/// client serialization boundary.
+pub(crate) fn project_without_viewer(state: &GameState) -> GameState {
+    let mut base = state.clone();
+    base.payment_transaction = None;
+    base.payment_transaction_replay = false;
+    base.payment_transaction_just_handled = false;
+    base
+}
+
 /// Materialize only for a viewer entitled to answer the current prompt. Other
 /// viewers keep the canonical base (plus the public prompt) so an uncommitted
 /// hand-to-graveyard move, life change, or other public mutation cannot be
@@ -857,6 +873,23 @@ mod tests {
             !actor_wire.to_string().contains("R5 hidden shadow card"),
             "actor wire leaked hidden identity: {actor_wire}"
         );
+
+        // An unscoped client wire has no authenticated actor. It must retain
+        // the canonical hidden card and never replay the staged hand-to-
+        // graveyard mutation merely to serialize a snapshot.
+        let unscoped_wire = serde_json::to_value(
+            crate::game::derived_views::ClientGameStateRef::wrap(&hidden_shadow, None),
+        )
+        .expect("unscoped wire projection");
+        assert_eq!(
+            unscoped_wire["state"]["objects"][hidden_card.0.to_string()]["zone"],
+            serde_json::to_value(Zone::Hand).expect("hand serializes")
+        );
+        assert_eq!(
+            unscoped_wire["state"]["objects"][hidden_card.0.to_string()]["name"],
+            "R5 hidden shadow card"
+        );
+        assert!(unscoped_wire["state"].get("payment_transaction").is_none());
 
         // R5a discriminator: this is a reachable production path, not a
         // hand-built descriptor. A turn controller (Player 1) submits the

@@ -1034,13 +1034,14 @@ fn client_state_wire_value(
     already_filtered: bool,
 ) -> serde_json::Result<serde_json::Value> {
     // CR 601.2h + CR 608.2c: direct client snapshots must pass through the
-    // same identity/knowledge redaction as the filtered-viewer path. A
-    // viewer-less internal wire keeps the historical full shadow materialization;
-    // wrap_filtered has already performed the viewer projection.
+    // same identity/knowledge redaction as the filtered-viewer path. An
+    // unscoped wire has no authenticated actor, so it must keep the canonical
+    // base and never materialize a staged shadow; wrap_filtered has already
+    // performed the viewer projection.
     let payment_projected = match (viewer, already_filtered) {
         (Some(viewer), false) => crate::game::visibility::filter_state_for_viewer(state, viewer),
         (Some(_), true) => state.clone(),
-        (None, false) => crate::game::payment_transaction::project(state),
+        (None, false) => crate::game::payment_transaction::project_without_viewer(state),
         (None, true) => state.clone(),
     };
     let projected_state =
