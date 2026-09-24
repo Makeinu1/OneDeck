@@ -142,6 +142,7 @@ pub mod players;
 pub(crate) mod precast_copy_shortcut;
 pub use precast_copy_shortcut::normalize_untrusted_restore;
 pub use precast_copy_shortcut::rekey_after_trusted_restore;
+pub(crate) mod payment_transaction;
 pub mod preview;
 pub mod printed_cards;
 pub mod priority;

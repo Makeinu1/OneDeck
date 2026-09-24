@@ -1,0 +1,974 @@
+//! Replayable, staged resolution-time composite payments.
+//!
+//! The descriptor in [`GameState::payment_transaction`] is the only durable
+//! transaction authority. It stores the untouched base implicitly (the live
+//! state) plus a serializable resolution root and the actions already accepted
+//! against its shadow. Every materialization starts from that base and runs the
+//! normal resolution/action pipeline; no second payment implementation lives
+//! here.
+
+use crate::game::effects;
+use crate::game::engine::{self, EngineError};
+use crate::types::ability::{EffectError, ResolvedAbility};
+use crate::types::actions::GameAction;
+use crate::types::events::GameEvent;
+use crate::types::game_state::{
+    ActionResult, GameState, ResolutionPaymentTransaction, ResolutionPaymentTranscriptEntry,
+};
+use crate::types::log::GameLogEntry;
+
+#[derive(Debug)]
+enum ReplayOutcome {
+    Paused {
+        shadow: GameState,
+    },
+    Completed {
+        shadow: GameState,
+        events: Vec<GameEvent>,
+        log_entries: Vec<GameLogEntry>,
+    },
+    Failed,
+}
+
+fn replay_error(error: EffectError) -> EngineError {
+    EngineError::InvalidAction(format!(
+        "staged payment transaction replay failed: {error:?}"
+    ))
+}
+
+/// Begin a staged transaction from the resolution-time `PayCost` authority.
+///
+/// The caller has not yet committed any payment mutation. The root is replayed
+/// on a shadow with the transient staging guard set, so the shadow uses the
+/// ordinary payment authority and cannot recursively create another descriptor.
+pub(crate) fn begin(
+    state: &mut GameState,
+    ability: &ResolvedAbility,
+    events: &mut Vec<GameEvent>,
+) -> Result<(), EffectError> {
+    let base = state.clone();
+    let mut shadow = base.clone();
+    shadow.payment_transaction = None;
+    shadow.payment_transaction_replay = true;
+    shadow.payment_transaction_just_handled = false;
+    let mut buffered_events = Vec::new();
+    effects::resolve_ability_chain(&mut shadow, ability, &mut buffered_events, 0)?;
+    shadow.payment_transaction_replay = false;
+
+    // A failed composite owns no partial payment and produces no payment events.
+    // Keep the canonical state byte-for-byte at the pre-payment base.
+    if shadow.cost_payment_failed_flag {
+        *state = base;
+        state.cost_payment_failed_flag = true;
+        // No shadow was committed, so the ordinary chain walker must still
+        // descend into the printed abort/independent continuation. A success
+        // or pause owns the complete root; a failure owns only the payment
+        // clause and leaves the generic CR 608.2c tail authority live.
+        state.payment_transaction_just_handled = false;
+        return Ok(());
+    }
+
+    // A synchronous success can commit the shadow atomically. The chain walker
+    // consumes `payment_transaction_just_handled` and returns before it can walk
+    // the same rider a second time.
+    if shadow.waiting_for == base.waiting_for {
+        shadow.payment_transaction = None;
+        shadow.payment_transaction_replay = false;
+        shadow.payment_transaction_just_handled = true;
+        *state = shadow;
+        events.extend(buffered_events);
+        return Ok(());
+    }
+
+    // An interactive choice paused the shadow. Persist only the replayable
+    // descriptor and the public projected prompt; all resource/object changes
+    // stay out of the canonical state until a later replay commits.
+    let owner = shadow
+        .waiting_for
+        .acting_players()
+        .first()
+        .copied()
+        .unwrap_or(ability.controller);
+    let transaction = ResolutionPaymentTransaction {
+        wire_version: 1,
+        owner,
+        root: Box::new(ability.clone()),
+        transcript: Vec::new(),
+        base_waiting_for: base.waiting_for.clone(),
+    };
+    *state = base;
+    state.payment_transaction = Some(Box::new(transaction));
+    state.waiting_for = shadow.waiting_for;
+    state.cost_payment_failed_flag = false;
+    state.payment_transaction_replay = false;
+    state.payment_transaction_just_handled = true;
+    Ok(())
+}
+
+fn replay(
+    state: &GameState,
+    transaction: &ResolutionPaymentTransaction,
+) -> Result<ReplayOutcome, EngineError> {
+    let mut shadow = state.clone();
+    shadow.payment_transaction = None;
+    shadow.payment_transaction_replay = true;
+    shadow.payment_transaction_just_handled = false;
+    shadow.cost_payment_failed_flag = false;
+    shadow.waiting_for = transaction.base_waiting_for.clone();
+
+    let mut buffered_events = Vec::new();
+    let mut buffered_log_entries: Vec<GameLogEntry> = Vec::new();
+    effects::resolve_ability_chain(&mut shadow, &transaction.root, &mut buffered_events, 0)
+        .map_err(replay_error)?;
+    // Keep the replay guard live while transcript actions drain the suspended
+    // continuation. A remaining Composite must use the ordinary sequential
+    // shadow authority, never open a nested descriptor of its own.
+    shadow.payment_transaction_replay = true;
+
+    if shadow.cost_payment_failed_flag {
+        return Ok(ReplayOutcome::Failed);
+    }
+
+    for entry in &transaction.transcript {
+        let result = engine::apply_recorded_action(&mut shadow, entry.actor, entry.action.clone())?;
+        buffered_events.extend(result.events);
+        buffered_log_entries.extend(result.log_entries);
+        if shadow.cost_payment_failed_flag {
+            return Ok(ReplayOutcome::Failed);
+        }
+        shadow.payment_transaction_replay = true;
+    }
+
+    shadow.payment_transaction_replay = false;
+
+    if shadow.waiting_for == transaction.base_waiting_for {
+        Ok(ReplayOutcome::Completed {
+            shadow,
+            events: buffered_events,
+            log_entries: buffered_log_entries,
+        })
+    } else {
+        Ok(ReplayOutcome::Paused { shadow })
+    }
+}
+
+/// Resume only the printed continuation after a staged payment abort.
+///
+/// The replay shadow has already evaluated the payment root and is discarded
+/// on failure. Re-entering the original root would pay/choose again, so hand
+/// the root's first child to the ordinary chain walker with the canonical
+/// payment-failure signal. Its existing condition/sibling logic then suppresses
+/// IfYouDo/WhenYouDo clauses and executes unconditional sequential siblings.
+fn resolve_abort_continuation(
+    state: &mut GameState,
+    root: &ResolvedAbility,
+    events: &mut Vec<GameEvent>,
+) -> Result<(), EngineError> {
+    let Some(sub) = root.sub_ability.as_deref() else {
+        return Ok(());
+    };
+    let mut continuation = sub.clone();
+    effects::apply_parent_chain_context(&mut continuation, root, None, state);
+    effects::resolve_ability_chain(state, &continuation, events, 0).map_err(replay_error)
+}
+
+/// Apply one player action against the live transaction's replayed shadow.
+///
+/// Pause keeps the canonical base and extends the transcript. Completion swaps
+/// in the materialized shadow and returns the complete buffered event stream.
+/// Failure aborts the descriptor and restores its base without publishing any
+/// payment events.
+pub(crate) fn apply_pending_action(
+    state: &mut GameState,
+    actor: crate::types::player::PlayerId,
+    action: GameAction,
+) -> Result<ActionResult, EngineError> {
+    let mut transaction = state
+        .payment_transaction
+        .as_ref()
+        .ok_or_else(|| EngineError::InvalidAction("no staged payment transaction".to_string()))?
+        .as_ref()
+        .clone();
+    transaction
+        .transcript
+        .push(ResolutionPaymentTranscriptEntry { actor, action });
+
+    match replay(state, &transaction)? {
+        ReplayOutcome::Failed => {
+            let mut restored = state.clone();
+            restored.payment_transaction = None;
+            restored.payment_transaction_replay = false;
+            restored.payment_transaction_just_handled = false;
+            restored.waiting_for = transaction.base_waiting_for;
+            restored.cost_payment_failed_flag = true;
+            *state = restored;
+            let mut continuation_events = Vec::new();
+            resolve_abort_continuation(state, &transaction.root, &mut continuation_events)?;
+            Ok(ActionResult {
+                events: continuation_events,
+                waiting_for: state.waiting_for.clone(),
+                log_entries: Vec::new(),
+            })
+        }
+        ReplayOutcome::Paused { shadow, .. } => {
+            let waiting_for = shadow.waiting_for.clone();
+            let mut projected = state.clone();
+            projected.payment_transaction = Some(Box::new(transaction));
+            projected.waiting_for = waiting_for.clone();
+            projected.cost_payment_failed_flag = false;
+            projected.payment_transaction_replay = false;
+            projected.payment_transaction_just_handled = false;
+            *state = projected;
+            Ok(ActionResult {
+                events: Vec::new(),
+                waiting_for,
+                log_entries: Vec::new(),
+            })
+        }
+        ReplayOutcome::Completed {
+            mut shadow,
+            events,
+            log_entries,
+        } => {
+            let waiting_for = shadow.waiting_for.clone();
+            shadow.payment_transaction = None;
+            shadow.payment_transaction_replay = false;
+            shadow.payment_transaction_just_handled = false;
+            *state = shadow;
+            Ok(ActionResult {
+                events,
+                waiting_for,
+                log_entries,
+            })
+        }
+    }
+}
+
+/// Materialize the public shadow used by viewer projections, client wires, and
+/// legal-action enumeration. A replay failure fails closed to the untouched
+/// base rather than exposing a partially mutated shadow.
+pub(crate) fn project(state: &GameState) -> GameState {
+    let Some(transaction) = state.payment_transaction.as_ref() else {
+        return state.clone();
+    };
+    match replay(state, transaction) {
+        Ok(ReplayOutcome::Paused { mut shadow, .. })
+        | Ok(ReplayOutcome::Completed { mut shadow, .. }) => {
+            shadow.payment_transaction = None;
+            shadow.payment_transaction_replay = false;
+            shadow.payment_transaction_just_handled = false;
+            shadow
+        }
+        Ok(ReplayOutcome::Failed) | Err(_) => {
+            let mut base = state.clone();
+            base.payment_transaction = None;
+            base.payment_transaction_replay = false;
+            base.payment_transaction_just_handled = false;
+            base.waiting_for = transaction.base_waiting_for.clone();
+            base
+        }
+    }
+}
+
+/// Materialize only for a viewer entitled to answer the current prompt. Other
+/// viewers keep the canonical base (plus the public prompt) so an uncommitted
+/// hand-to-graveyard move, life change, or other public mutation cannot be
+/// observed and later rolled back in front of them.
+pub(crate) fn project_for_viewer(
+    state: &GameState,
+    viewer: crate::types::player::PlayerId,
+) -> GameState {
+    let Some(_transaction) = state.payment_transaction.as_ref() else {
+        return state.clone();
+    };
+    let shadow = project(state);
+    // CR 103.5 + CR 723.5: shadow access follows the exact submitter set that
+    // admits the next action. A semantic seat is not enough when a controller
+    // effect routes its prompt to another actor; fail closed to the canonical
+    // base unless the viewer is that currently authorized submitter.
+    let viewer_is_authorized =
+        crate::game::turn_control::authorized_submitters(state).contains(&viewer);
+    if viewer_is_authorized {
+        return shadow;
+    }
+
+    let mut base = state.clone();
+    base.payment_transaction = None;
+    base.payment_transaction_replay = false;
+    base.payment_transaction_just_handled = false;
+    // Keep the current public prompt while retaining every resource/object
+    // field at the canonical pre-payment base.
+    base.waiting_for = shadow.waiting_for;
+    base
+}
+
+/// Whether the transaction path should own this action. Actor-scoped display
+/// preferences remain ordinary reducer actions while a payment prompt is open.
+pub(crate) fn owns_action(state: &GameState, action: &GameAction) -> bool {
+    state.payment_transaction.is_some() && !action.is_actor_scoped_preference()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use crate::game::zones::create_object;
+    use crate::types::ability::{
+        AbilityCondition, AbilityCost, AbilityDefinition, AbilityKind, Effect, EffectOutcomeSignal,
+        PlayerFilter, QuantityExpr, QuantityModification, ReplacementDefinition, SubAbilityLink,
+        TargetFilter, TargetRef,
+    };
+    use crate::types::events::GameEvent;
+    use crate::types::identifiers::{CardId, ObjectId};
+    use crate::types::mana::{ManaCost, ManaCostShard};
+    use crate::types::player::PlayerId;
+    use crate::types::replacements::ReplacementEvent;
+    use crate::types::zones::Zone;
+
+    // The behavioral T1–T4 fixtures live beside the payment authority in the
+    // engine test suite; this module keeps one small persistence witness close
+    // to the descriptor implementation itself.
+    #[test]
+    fn descriptor_round_trips_without_serializing_transient_replay_flags() {
+        let mut state = GameState::new_two_player(7);
+        state.payment_transaction = Some(Box::new(ResolutionPaymentTransaction {
+            wire_version: 1,
+            owner: crate::types::player::PlayerId(0),
+            root: Box::new(crate::types::ability::ResolvedAbility::new(
+                crate::types::ability::Effect::GenericEffect {
+                    static_abilities: Vec::new(),
+                    duration: None,
+                    target: None,
+                    end_cost: None,
+                },
+                Vec::new(),
+                crate::types::identifiers::ObjectId(1),
+                crate::types::player::PlayerId(0),
+            )),
+            transcript: vec![ResolutionPaymentTranscriptEntry {
+                actor: PlayerId(1),
+                action: GameAction::PassPriority,
+            }],
+            base_waiting_for: crate::types::game_state::WaitingFor::Priority {
+                player: crate::types::player::PlayerId(0),
+            },
+        }));
+        state.payment_transaction_replay = true;
+        state.payment_transaction_just_handled = true;
+        let value = serde_json::to_value(&state).expect("state serializes");
+        assert!(value.get("payment_transaction").is_some());
+        assert!(value.get("payment_transaction_replay").is_none());
+        assert!(value.get("payment_transaction_just_handled").is_none());
+        let restored: GameState = serde_json::from_value(value).expect("state restores");
+        assert!(restored.payment_transaction.is_some());
+        assert!(!restored.payment_transaction_replay);
+        assert!(!restored.payment_transaction_just_handled);
+        assert_eq!(
+            restored.payment_transaction.as_ref().unwrap().transcript[0].actor,
+            PlayerId(1)
+        );
+    }
+
+    fn life_composite_case(life: i32) -> (GameState, ResolvedAbility) {
+        let mut state = GameState::new_two_player(42);
+        state.players[0].life = life;
+        let root = ResolvedAbility::new(
+            Effect::PayCost {
+                cost: AbilityCost::Composite {
+                    costs: vec![
+                        AbilityCost::PayLife {
+                            amount: QuantityExpr::Fixed { value: 6 },
+                        },
+                        AbilityCost::PayLife {
+                            amount: QuantityExpr::Fixed { value: 6 },
+                        },
+                    ],
+                },
+                scale: None,
+                payer: TargetFilter::Controller,
+            },
+            Vec::new(),
+            ObjectId(1),
+            PlayerId(0),
+        );
+        (state, root)
+    }
+
+    fn phyrexian_energy_case(energy: u32) -> (GameState, ResolvedAbility) {
+        let mut state = GameState::new_two_player(42);
+        state.players[0].energy = energy;
+        let source = create_object(
+            &mut state,
+            CardId(904),
+            PlayerId(0),
+            "R5 Phyrexian shadow source".to_string(),
+            Zone::Battlefield,
+        );
+        let replacement_choice = AbilityDefinition::new(
+            AbilityKind::Spell,
+            Effect::ChooseOneOf {
+                chooser: PlayerFilter::Controller,
+                branches: vec![AbilityDefinition::new(
+                    AbilityKind::Spell,
+                    Effect::GainLife {
+                        amount: QuantityExpr::Fixed { value: 1 },
+                        player: TargetFilter::Controller,
+                    },
+                )],
+            },
+        );
+        state
+            .objects
+            .get_mut(&source)
+            .expect("replacement source")
+            .replacement_definitions = vec![ReplacementDefinition::new(ReplacementEvent::LoseLife)
+            .quantity_modification(QuantityModification::Plus { value: 0 })
+            .execute(replacement_choice)]
+        .into();
+
+        let mut root = ResolvedAbility::new(
+            Effect::PayCost {
+                cost: AbilityCost::Composite {
+                    costs: vec![
+                        AbilityCost::Mana {
+                            cost: ManaCost::Cost {
+                                shards: vec![ManaCostShard::PhyrexianBlack],
+                                generic: 0,
+                            },
+                        },
+                        AbilityCost::PayEnergy {
+                            amount: QuantityExpr::Fixed { value: 1 },
+                        },
+                    ],
+                },
+                scale: None,
+                payer: TargetFilter::Controller,
+            },
+            Vec::new(),
+            source,
+            PlayerId(0),
+        );
+        let mut rider = ResolvedAbility::new(
+            Effect::GainLife {
+                amount: QuantityExpr::Fixed { value: 7 },
+                player: TargetFilter::Controller,
+            },
+            Vec::new(),
+            source,
+            PlayerId(0),
+        );
+        rider.sub_link = SubAbilityLink::SequentialSibling;
+        root.sub_ability = Some(Box::new(rider));
+        (state, root)
+    }
+
+    fn discard_exile_case() -> (GameState, ResolvedAbility, ObjectId) {
+        let mut state = GameState::new_two_player(42);
+        let card = create_object(
+            &mut state,
+            CardId(906),
+            PlayerId(0),
+            "R5 discard then exile".to_string(),
+            Zone::Hand,
+        );
+        create_object(
+            &mut state,
+            CardId(908),
+            PlayerId(0),
+            "R5 alternate discard".to_string(),
+            Zone::Hand,
+        );
+        let root = ResolvedAbility::new(
+            Effect::PayCost {
+                cost: AbilityCost::Composite {
+                    costs: vec![
+                        AbilityCost::Discard {
+                            count: QuantityExpr::Fixed { value: 1 },
+                            filter: None,
+                            selection: crate::types::ability::CardSelectionMode::Chosen,
+                            self_scope: crate::types::ability::DiscardSelfScope::FromHand,
+                        },
+                        AbilityCost::Exile {
+                            count: 1,
+                            zone: Some(Zone::Graveyard),
+                            filter: None,
+                        },
+                    ],
+                },
+                scale: None,
+                payer: TargetFilter::Controller,
+            },
+            Vec::new(),
+            ObjectId(907),
+            PlayerId(0),
+        );
+        (state, root, card)
+    }
+
+    fn hidden_shadow_case() -> (GameState, ObjectId) {
+        let mut state = GameState::new_two_player(42);
+        let hidden_card = create_object(
+            &mut state,
+            CardId(909),
+            PlayerId(1),
+            "R5 hidden shadow card".to_string(),
+            Zone::Hand,
+        );
+        let root = ResolvedAbility::new(
+            Effect::ChangeZone {
+                origin: Some(Zone::Hand),
+                destination: Zone::Graveyard,
+                target: TargetFilter::Any,
+                owner_library: false,
+                enter_transformed: false,
+                enters_under: None,
+                enter_tapped: crate::types::zones::EtbTapState::Unspecified,
+                enters_attacking: false,
+                up_to: false,
+                enter_with_counters: Vec::new(),
+                conditional_enter_with_counters: Vec::new(),
+                face_down_profile: None,
+                enters_modified_if: None,
+            },
+            vec![TargetRef::Object(hidden_card)],
+            hidden_card,
+            PlayerId(0),
+        );
+        state.waiting_for = crate::types::game_state::WaitingFor::Priority {
+            player: PlayerId(0),
+        };
+        state.payment_transaction = Some(Box::new(ResolutionPaymentTransaction {
+            wire_version: 1,
+            owner: PlayerId(0),
+            root: Box::new(root),
+            transcript: Vec::new(),
+            base_waiting_for: state.waiting_for.clone(),
+        }));
+        (state, hidden_card)
+    }
+
+    /// A production-pipeline hidden-information witness for the final R5a gate.
+    /// The semantic payer is Player 0, but a turn-control effect routes the
+    /// prompt to Player 1. Player 1 does not know Player 0's hand. The first
+    /// supported cost pauses for a discard selection; accepting that selection
+    /// moves the hidden card into the public graveyard in the shadow, then the
+    /// Phyrexian replacement prompt pauses before the unpayable energy suffix.
+    fn controlled_discard_phyrexian_case() -> (GameState, ResolvedAbility, ObjectId) {
+        let mut state = GameState::new_two_player(42);
+        state.active_player = PlayerId(0);
+        state.turn_decision_controller = Some(PlayerId(1));
+        state.players[0].energy = 0;
+        let hidden_card = create_object(
+            &mut state,
+            CardId(910),
+            PlayerId(0),
+            "R5 controller-hidden card".to_string(),
+            Zone::Hand,
+        );
+        create_object(
+            &mut state,
+            CardId(911),
+            PlayerId(0),
+            "R5 controller-hidden alternate".to_string(),
+            Zone::Hand,
+        );
+        let source = create_object(
+            &mut state,
+            CardId(912),
+            PlayerId(0),
+            "R5 controlled phyrexian source".to_string(),
+            Zone::Battlefield,
+        );
+        let replacement_choice = AbilityDefinition::new(
+            AbilityKind::Spell,
+            Effect::ChooseOneOf {
+                chooser: PlayerFilter::Controller,
+                branches: vec![AbilityDefinition::new(
+                    AbilityKind::Spell,
+                    Effect::GainLife {
+                        amount: QuantityExpr::Fixed { value: 1 },
+                        player: TargetFilter::Controller,
+                    },
+                )],
+            },
+        );
+        state
+            .objects
+            .get_mut(&source)
+            .expect("controlled replacement source")
+            .replacement_definitions = vec![ReplacementDefinition::new(ReplacementEvent::LoseLife)
+            .quantity_modification(QuantityModification::Plus { value: 0 })
+            .execute(replacement_choice)]
+        .into();
+        let mut root = ResolvedAbility::new(
+            Effect::PayCost {
+                cost: AbilityCost::Composite {
+                    costs: vec![
+                        AbilityCost::Discard {
+                            count: QuantityExpr::Fixed { value: 1 },
+                            filter: None,
+                            selection: crate::types::ability::CardSelectionMode::Chosen,
+                            self_scope: crate::types::ability::DiscardSelfScope::FromHand,
+                        },
+                        AbilityCost::Mana {
+                            cost: ManaCost::Cost {
+                                shards: vec![ManaCostShard::PhyrexianBlack],
+                                generic: 0,
+                            },
+                        },
+                        AbilityCost::PayEnergy {
+                            amount: QuantityExpr::Fixed { value: 1 },
+                        },
+                    ],
+                },
+                scale: None,
+                payer: TargetFilter::Controller,
+            },
+            Vec::new(),
+            source,
+            PlayerId(0),
+        );
+        // Abort discriminator: the accepted/IfYouDo rider must be suppressed
+        // after the later energy suffix fails, while the unconditional printed
+        // sibling still resolves once on the restored canonical base.
+        let mut gated = ResolvedAbility::new(
+            Effect::GainLife {
+                amount: QuantityExpr::Fixed { value: 2 },
+                player: TargetFilter::Controller,
+            },
+            Vec::new(),
+            source,
+            PlayerId(0),
+        );
+        gated.condition = Some(AbilityCondition::EffectOutcome {
+            signal: EffectOutcomeSignal::OptionalEffectPerformed,
+        });
+        let mut unconditional = ResolvedAbility::new(
+            Effect::GainLife {
+                amount: QuantityExpr::Fixed { value: 3 },
+                player: TargetFilter::Controller,
+            },
+            Vec::new(),
+            source,
+            PlayerId(0),
+        );
+        unconditional.sub_link = SubAbilityLink::SequentialSibling;
+        gated.sub_ability = Some(Box::new(unconditional));
+        root.sub_ability = Some(Box::new(gated));
+        (state, root, hidden_card)
+    }
+
+    #[test]
+    fn staged_composite_payment_r5_regression_matrix() {
+        // T1: the failed composite never mutates canonical life and publishes
+        // no payment events.
+        let (mut t1, root_t1) = life_composite_case(10);
+        let mut t1_events = Vec::new();
+        effects::resolve_ability_chain(&mut t1, &root_t1, &mut t1_events, 0)
+            .expect("T1 resolution does not error");
+        assert_eq!(t1.players[0].life, 10);
+        assert!(t1.payment_transaction.is_none());
+        assert!(t1_events.is_empty());
+
+        // T2: both life payments commit once, with one event per component.
+        let (mut t2, root_t2) = life_composite_case(13);
+        let mut t2_events = Vec::new();
+        effects::resolve_ability_chain(&mut t2, &root_t2, &mut t2_events, 0)
+            .expect("T2 resolution");
+        assert_eq!(t2.players[0].life, 1);
+        assert!(t2.payment_transaction.is_none());
+        assert_eq!(
+            t2_events
+                .iter()
+                .filter(|event| matches!(event, GameEvent::LifeChanged { amount: -6, .. }))
+                .count(),
+            2,
+            "each committed PayLife component emits exactly once"
+        );
+
+        // T3: the first component pauses on the replacement choice. Selecting
+        // the branch then fails at the energy suffix, restoring BASE exactly.
+        let (mut t3, root_t3) = phyrexian_energy_case(0);
+        let mut t3_events = Vec::new();
+        effects::resolve_ability_chain(&mut t3, &root_t3, &mut t3_events, 0)
+            .expect("T3 initial resolution");
+        assert!(t3.payment_transaction.is_some());
+        assert!(matches!(
+            t3.waiting_for,
+            crate::types::game_state::WaitingFor::ChooseOneOfBranch { .. }
+        ));
+        assert_eq!(t3.players[0].life, 20);
+        assert_eq!(t3.players[0].energy, 0);
+        let t3_result =
+            apply_pending_action(&mut t3, PlayerId(0), GameAction::ChooseBranch { index: 0 })
+                .expect("T3 branch action");
+        assert_eq!(t3.players[0].life, 27);
+        assert_eq!(
+            t3_result
+                .events
+                .iter()
+                .filter(|event| matches!(
+                    event,
+                    GameEvent::LifeChanged {
+                        player_id: PlayerId(0),
+                        amount: 7,
+                        ..
+                    }
+                ))
+                .count(),
+            1,
+            "the unconditional rider survives the aborted payment exactly once"
+        );
+        assert!(!t3_result.events.iter().any(|event| matches!(
+            event,
+            GameEvent::LifeChanged { amount: -2, .. } | GameEvent::EnergyChanged { .. }
+        )));
+        assert!(t3.payment_transaction.is_none());
+        assert_eq!(t3.players[0].life, 27);
+        assert_eq!(t3.players[0].energy, 0);
+        assert!(matches!(
+            t3.waiting_for,
+            crate::types::game_state::WaitingFor::Priority { .. }
+        ));
+
+        // T4: the same transcript succeeds with one energy, and the final
+        // materialized state contains the replacement branch plus rider once.
+        let (mut t4, root_t4) = phyrexian_energy_case(1);
+        let mut t4_events = Vec::new();
+        effects::resolve_ability_chain(&mut t4, &root_t4, &mut t4_events, 0)
+            .expect("T4 initial resolution");
+        assert!(t4.payment_transaction.is_some());
+        let t4_result =
+            crate::game::engine::apply_as_current(&mut t4, GameAction::ChooseBranch { index: 0 })
+                .expect("T4 boundary branch action");
+        assert_eq!(t4.players[0].life, 26);
+        assert_eq!(t4.players[0].energy, 0);
+        assert!(t4.payment_transaction.is_none());
+        assert!(matches!(
+            t4.waiting_for,
+            crate::types::game_state::WaitingFor::Priority { .. }
+        ));
+        assert_eq!(
+            t4_result
+                .events
+                .iter()
+                .filter(|event| matches!(
+                    event,
+                    GameEvent::EnergyChanged {
+                        player: PlayerId(0),
+                        delta: -1,
+                    }
+                ))
+                .count(),
+            1,
+            "the suffix payment is committed exactly once"
+        );
+
+        // Discard -> Exile: no preflight failure is allowed before the discard
+        // choice. The two accepted choices remain shadow-only until commit.
+        let (mut discard, root_discard, discarded_card) = discard_exile_case();
+        let mut discard_events = Vec::new();
+        effects::resolve_ability_chain(&mut discard, &root_discard, &mut discard_events, 0)
+            .expect("discard initial resolution");
+        assert!(discard.payment_transaction.is_some());
+        assert!(matches!(
+            discard.waiting_for,
+            crate::types::game_state::WaitingFor::DiscardChoice { .. }
+        ));
+        assert_eq!(discard.objects[&discarded_card].zone, Zone::Hand);
+        apply_pending_action(
+            &mut discard,
+            PlayerId(0),
+            GameAction::SelectCards {
+                cards: vec![discarded_card],
+            },
+        )
+        .expect("discard choice");
+        assert_eq!(
+            discard
+                .payment_transaction
+                .as_ref()
+                .expect("transaction remains paused")
+                .transcript[0]
+                .actor,
+            PlayerId(0)
+        );
+        assert!(matches!(
+            discard.waiting_for,
+            crate::types::game_state::WaitingFor::EffectZoneChoice { .. }
+        ));
+        assert_eq!(discard.objects[&discarded_card].zone, Zone::Hand);
+        let commit = apply_pending_action(
+            &mut discard,
+            PlayerId(0),
+            GameAction::SelectCards {
+                cards: vec![discarded_card],
+            },
+        )
+        .expect("exile choice");
+        assert!(discard.payment_transaction.is_none());
+        assert_eq!(discard.objects[&discarded_card].zone, Zone::Exile);
+        assert!(!commit.events.is_empty());
+
+        // While the second choice is pending, the owner may see the shadow,
+        // but an opponent must retain the canonical hand card. This is the
+        // knowledge/rollback witness: the later commit/abort cannot leak a
+        // transient public-zone mutation to another viewer.
+        let (mut privacy, privacy_root, privacy_card) = discard_exile_case();
+        let mut privacy_events = Vec::new();
+        effects::resolve_ability_chain(&mut privacy, &privacy_root, &mut privacy_events, 0)
+            .expect("privacy initial resolution");
+        apply_pending_action(
+            &mut privacy,
+            PlayerId(0),
+            GameAction::SelectCards {
+                cards: vec![privacy_card],
+            },
+        )
+        .expect("privacy discard choice");
+        let owner_view = crate::game::visibility::filter_state_for_viewer(&privacy, PlayerId(0));
+        let opponent_view = crate::game::visibility::filter_state_for_viewer(&privacy, PlayerId(1));
+        assert_eq!(owner_view.objects[&privacy_card].zone, Zone::Graveyard);
+        assert_eq!(opponent_view.objects[&privacy_card].zone, Zone::Hand);
+        assert!(opponent_view.payment_transaction.is_none());
+        let opponent_wire = serde_json::to_value(
+            crate::game::derived_views::ClientGameStateRef::wrap(&privacy, Some(PlayerId(1))),
+        )
+        .expect("opponent wire projection");
+        assert_eq!(
+            opponent_wire["state"]["objects"][privacy_card.0.to_string()]["zone"],
+            serde_json::to_value(Zone::Hand).expect("hand serializes")
+        );
+
+        // Even the prompt actor must not gain an identity that was hidden in
+        // the canonical base. The shadow moves another player's hand card to a
+        // public zone, but the viewer filter applies the canonical knowledge
+        // authority before serializing either the filtered or direct wire.
+        let (hidden_shadow, hidden_card) = hidden_shadow_case();
+        let actor_view =
+            crate::game::visibility::filter_state_for_viewer(&hidden_shadow, PlayerId(0));
+        assert_eq!(actor_view.objects[&hidden_card].zone, Zone::Graveyard);
+        assert_eq!(actor_view.objects[&hidden_card].name, "Hidden Card");
+        let actor_wire = serde_json::to_value(
+            crate::game::derived_views::ClientGameStateRef::wrap(&hidden_shadow, Some(PlayerId(0))),
+        )
+        .expect("actor wire projection");
+        assert!(
+            !actor_wire.to_string().contains("R5 hidden shadow card"),
+            "actor wire leaked hidden identity: {actor_wire}"
+        );
+
+        // R5a discriminator: this is a reachable production path, not a
+        // hand-built descriptor. A turn controller (Player 1) submits the
+        // semantic payer's (Player 0) discard, so the controller cannot learn
+        // the card identity merely because the tentative shadow moved it to a
+        // public zone before the later energy failure.
+        let (mut controlled, controlled_root, controlled_card) =
+            controlled_discard_phyrexian_case();
+        let mut controlled_events = Vec::new();
+        effects::resolve_ability_chain(
+            &mut controlled,
+            &controlled_root,
+            &mut controlled_events,
+            0,
+        )
+        .expect("controlled hidden-information resolution reaches discard choice");
+        assert!(matches!(
+            controlled.waiting_for,
+            crate::types::game_state::WaitingFor::DiscardChoice { .. }
+        ));
+        assert_eq!(controlled.objects[&controlled_card].zone, Zone::Hand);
+        let discard_selection = GameAction::SelectCards {
+            cards: vec![controlled_card],
+        };
+        crate::game::engine::apply_as_current(&mut controlled, discard_selection)
+            .expect("authorized turn controller submits discard");
+        assert!(matches!(
+            controlled.waiting_for,
+            crate::types::game_state::WaitingFor::ChooseOneOfBranch { .. }
+        ));
+        assert_eq!(controlled.objects[&controlled_card].zone, Zone::Hand);
+        let semantic_view =
+            crate::game::visibility::filter_state_for_viewer(&controlled, PlayerId(0));
+        let controller_view =
+            crate::game::visibility::filter_state_for_viewer(&controlled, PlayerId(1));
+        assert_eq!(semantic_view.objects[&controlled_card].zone, Zone::Hand);
+        assert_eq!(
+            controller_view.objects[&controlled_card].zone,
+            Zone::Graveyard
+        );
+        assert_eq!(
+            controller_view.objects[&controlled_card].name,
+            "Hidden Card"
+        );
+        let controller_wire = serde_json::to_value(
+            crate::game::derived_views::ClientGameStateRef::wrap(&controlled, Some(PlayerId(1))),
+        )
+        .expect("controller wire projection");
+        assert!(
+            !controller_wire
+                .to_string()
+                .contains("R5 controller-hidden card"),
+            "authorized controller wire leaked hidden identity: {controller_wire}"
+        );
+        let abort = crate::game::engine::apply_as_current(
+            &mut controlled,
+            GameAction::ChooseBranch { index: 0 },
+        )
+        .expect("replacement choice reaches failing energy suffix");
+        assert_eq!(controlled.players[0].life, 23);
+        assert_eq!(
+            abort
+                .events
+                .iter()
+                .filter(|event| matches!(
+                    event,
+                    GameEvent::LifeChanged {
+                        player_id: PlayerId(0),
+                        amount: 3,
+                        ..
+                    }
+                ))
+                .count(),
+            1,
+            "the unconditional abort sibling resolves exactly once"
+        );
+        assert!(
+            !abort.events.iter().any(|event| matches!(
+                event,
+                GameEvent::LifeChanged { amount: 1, .. }
+                    | GameEvent::LifeChanged { amount: -1, .. }
+                    | GameEvent::EnergyChanged { .. }
+            )),
+            "discarded payment/replacement prefix must not publish events"
+        );
+        assert!(controlled.payment_transaction.is_none());
+        assert_eq!(controlled.objects[&controlled_card].zone, Zone::Hand);
+        assert!(matches!(
+            controlled.waiting_for,
+            crate::types::game_state::WaitingFor::Priority { .. }
+        ));
+
+        // Descriptor persistence is canonical+transcript only. Viewer and wire
+        // projections materialize the public shadow and never expose the root.
+        let (mut paused, paused_root) = phyrexian_energy_case(0);
+        let mut paused_events = Vec::new();
+        effects::resolve_ability_chain(&mut paused, &paused_root, &mut paused_events, 0)
+            .expect("privacy pause");
+        let mut persisted = serde_json::to_value(&paused).expect("transaction persistence");
+        assert!(persisted.get("payment_transaction").is_some());
+        assert!(persisted.get("payment_transaction_replay").is_none());
+        assert!(persisted.get("payment_transaction_just_handled").is_none());
+        let restored: GameState =
+            serde_json::from_value(persisted.take()).expect("transaction restore");
+        assert!(restored.payment_transaction.is_some());
+        assert!(!restored.payment_transaction_replay);
+        assert!(!restored.payment_transaction_just_handled);
+        let filtered = crate::game::visibility::filter_state_for_viewer(&paused, PlayerId(1));
+        assert!(filtered.payment_transaction.is_none());
+        assert!(matches!(
+            filtered.waiting_for,
+            crate::types::game_state::WaitingFor::ChooseOneOfBranch { .. }
+        ));
+    }
+}

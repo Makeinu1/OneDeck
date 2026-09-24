@@ -1023,7 +1023,58 @@ pub(crate) fn proposer_hidden_view(state: &GameState, proposer: PlayerId) -> Gam
 /// Hides all opponents' hand contents and all library contents except where the
 /// viewer is explicitly allowed to see them.
 pub fn filter_state_for_viewer(state: &GameState, viewer: PlayerId) -> GameState {
-    let mut filtered = state.clone();
+    // CR 601.2h + CR 608.2c: only the actor entitled to answer the staged
+    // prompt receives its materialized shadow. Other viewers retain the
+    // canonical base, preventing an uncommitted public-zone mutation from
+    // becoming observable before a later abort/commit decision.
+    let mut filtered = crate::game::payment_transaction::project_for_viewer(state, viewer);
+    // CR 400.2 + CR 608.2h: an authorized submitter may receive the staged
+    // shadow's zone/choice shape, but that shadow must not mint a new card
+    // identity for a controller who could not identify the canonical hidden
+    // object. Compare the canonical base with the already-materialized shadow
+    // and redact only hidden-zone objects that crossed into a public zone;
+    // already-known/revealed identities remain visible as before. This is a
+    // display-only overlay, so the authoritative replay still retains the
+    // real object and transcript.
+    let staged_hidden_identity_ids: HashSet<ObjectId> = state
+        .payment_transaction
+        .as_ref()
+        .map(|_| {
+            state
+                .objects
+                .iter()
+                .filter_map(|(object_id, base_object)| {
+                    let projected_object = filtered.objects.get(object_id)?;
+                    let crossed_hidden_boundary =
+                        matches!(base_object.zone, Zone::Hand | Zone::Library)
+                            && projected_object.zone != base_object.zone;
+                    let identity_already_known = state
+                        .viewer_knows_card_identity(viewer, *object_id)
+                        || state.revealed_cards.contains(object_id)
+                        || state.public_revealed_cards.contains(object_id);
+                    (crossed_hidden_boundary
+                        && base_object.owner != viewer
+                        && !identity_already_known)
+                        .then_some(*object_id)
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    for object_id in &staged_hidden_identity_ids {
+        let (face_down, foretold) = filtered
+            .objects
+            .get(object_id)
+            .map(|object| (object.face_down, object.foretold))
+            .unwrap_or((false, false));
+        hide_card(&mut filtered, *object_id);
+        if let Some(object) = filtered.objects.get_mut(object_id) {
+            // This is a hidden-identity overlay, not a face-down zone change:
+            // retain the projected object's zone/face-down state after the
+            // shared hide leaf clears every printed and derived characteristic.
+            object.face_down = face_down;
+            object.foretold = foretold;
+        }
+    }
     // This clone is a display snapshot, never rules authority: the ~20 private
     // carriers blanked below are dropped while the public `waiting_for` that
     // stands over them is preserved. Record that here so the fact survives
@@ -1262,6 +1313,31 @@ pub fn filter_state_for_viewer(state: &GameState, viewer: PlayerId) -> GameState
             }
         }
     }
+
+    // CR 400.2 + CR 400.7: the turn-scoped zone-change journal snapshots a
+    // card's identity independently of `objects`. A staged shadow may append a
+    // hand -> public-zone record before commit, so redact that record from a
+    // viewer who could not identify the canonical object. Otherwise the object
+    // is hidden but its journal still leaks the same card name/LKI.
+    let mut hidden_zone_change_ids: HashSet<ObjectId> =
+        identity_projection_for_viewer(state, viewer)
+            .into_iter()
+            .filter_map(|(object_id, projection)| {
+                matches!(projection, IdentityProjection::Hidden).then_some(object_id)
+            })
+            .collect();
+    hidden_zone_change_ids.extend(staged_hidden_identity_ids);
+    filtered.zone_changes_this_turn = filtered
+        .zone_changes_this_turn
+        .iter()
+        .cloned()
+        .map(|mut record| {
+            if hidden_zone_change_ids.contains(&record.object_id) {
+                redact_zone_change_record(&mut record);
+            }
+            record
+        })
+        .collect();
 
     // Source-bound named choices carry complete source contexts in authoritative
     // state. The client needs only the exact public prompt projection, never its
@@ -2670,6 +2746,29 @@ fn redact_printed_identity(obj: &mut crate::game::game_object::GameObject) {
     Arc::make_mut(&mut obj.base_static_definitions).clear();
     obj.base_color.clear();
     obj.base_printed_ref = None;
+}
+
+fn redact_zone_change_record(record: &mut crate::types::game_state::ZoneChangeRecord) {
+    record.name = HIDDEN_CARD_NAME.to_string();
+    record.core_types.clear();
+    record.subtypes.clear();
+    record.supertypes.clear();
+    record.keywords.clear();
+    record.trigger_definitions.clear();
+    record.trigger_source_context = None;
+    record.power = None;
+    record.toughness = None;
+    record.base_power = None;
+    record.base_toughness = None;
+    record.colors.clear();
+    record.mana_value = 0;
+    record.cast_from_zone = None;
+    record.played_from_zone = None;
+    record.attachments.clear();
+    record.linked_exile_snapshot.clear();
+    record.is_token = false;
+    record.combat_status = Default::default();
+    record.co_departed.clear();
 }
 
 fn hide_card(state: &mut GameState, obj_id: ObjectId) {
