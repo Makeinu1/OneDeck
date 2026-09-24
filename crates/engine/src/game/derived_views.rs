@@ -1041,7 +1041,7 @@ fn client_state_wire_value(
     let payment_projected = match (viewer, already_filtered) {
         (Some(viewer), false) => crate::game::visibility::filter_state_for_viewer(state, viewer),
         (Some(_), true) => state.clone(),
-        (None, false) => crate::game::payment_transaction::project_without_viewer(state),
+        (None, false) => crate::game::visibility::filter_state_for_unseated_viewer(state),
         (None, true) => state.clone(),
     };
     let projected_state =

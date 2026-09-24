@@ -1259,7 +1259,14 @@ pub(crate) fn apply_interaction_for_prospective_simulation(
     semantic_owner: PlayerId,
     action: GameAction,
 ) -> Result<ProspectiveSimulationOutcome, EngineError> {
-    let raw = apply_action_boundary_core(state, authenticated_actor, semantic_owner, action, None)?;
+    let raw = apply_action_boundary_core(
+        state,
+        authenticated_actor,
+        semantic_owner,
+        action,
+        None,
+        true,
+    )?;
     let (action, lifecycle_facts) = finish_action_boundary_with_lifecycle(
         state,
         raw,
@@ -1281,7 +1288,14 @@ pub(crate) fn apply_interaction_pre_reconciliation_for_life_safety(
     semantic_owner: PlayerId,
     action: GameAction,
 ) -> Result<ActionResult, EngineError> {
-    let raw = apply_action_boundary_core(state, authenticated_actor, semantic_owner, action, None)?;
+    let raw = apply_action_boundary_core(
+        state,
+        authenticated_actor,
+        semantic_owner,
+        action,
+        None,
+        true,
+    )?;
     let RawActionApplication {
         result, lifecycle, ..
     } = raw;
@@ -1345,6 +1359,7 @@ pub(super) fn apply_action_boundary_with_stack_limit(
         semantic_owner,
         action,
         stack_resolution_limit,
+        true,
     )?;
     finish_action_boundary(state, raw, mode)
 }
@@ -1402,6 +1417,7 @@ fn apply_action_boundary_core(
     semantic_owner: PlayerId,
     action: GameAction,
     stack_resolution_limit: Option<u32>,
+    authorize_actor: bool,
 ) -> Result<RawActionApplication, EngineError> {
     let lifecycle = super::lifecycle::enter_action_frame();
     if let Err(error) = mana_sources::preflight_tap_land_action(state, authenticated_actor, &action)
@@ -1463,8 +1479,9 @@ fn apply_action_boundary_core(
     // defers to the next boundary at which the flag is clear. No "outermost"
     // depth test is added: gating on it would leave AI-probe clones unrepaired
     // while the real state is repaired.
-    let pre_recovery_pass_was_authorized = matches!(&action, GameAction::PassPriority)
-        && check_actor_authorization(state, authenticated_actor, &action).is_ok();
+    let pre_recovery_pass_was_authorized = !authorize_actor
+        || (matches!(&action, GameAction::PassPriority)
+            && check_actor_authorization(state, authenticated_actor, &action).is_ok());
     let recovered_terminal_rest_boundary = sweep_and_recover_priority_boundary_rest(state);
     let recovered_stale_priority_pass =
         recovered_terminal_rest_boundary && matches!(&action, GameAction::PassPriority);
@@ -1496,11 +1513,11 @@ fn apply_action_boundary_core(
     state.exiled_from_hand_this_resolution = 0;
     state.die_result_this_resolution = None;
     state.consumed_before_priority_trigger_events.clear();
-    if recovered_stale_priority_pass && !pre_recovery_pass_was_authorized {
+    if authorize_actor && recovered_stale_priority_pass && !pre_recovery_pass_was_authorized {
         lifecycle.discard();
         return Err(EngineError::WrongPlayer);
     }
-    if !recovered_stale_priority_pass {
+    if authorize_actor && !recovered_stale_priority_pass {
         if let Err(err) = check_actor_authorization(state, authenticated_actor, &action) {
             lifecycle.discard();
             *state = boundary_snapshot;
@@ -8121,6 +8138,28 @@ pub(crate) fn apply_recorded_action(
         action,
         PublicFinalizeMode::Immediate,
     )
+}
+
+/// Replays an action that already crossed the authenticated interaction
+/// boundary. The transcript supplies both halves of that boundary, so replay
+/// must not re-authorize the historical submitter against a later topology
+/// (for example after that controller concedes). New incoming actions still
+/// use [`apply_recorded_action`] or the public boundary and remain fail-closed.
+pub(crate) fn apply_admitted_recorded_action(
+    state: &mut GameState,
+    authenticated_actor: PlayerId,
+    semantic_owner: PlayerId,
+    action: GameAction,
+) -> Result<ActionResult, EngineError> {
+    let raw = apply_action_boundary_core(
+        state,
+        authenticated_actor,
+        semantic_owner,
+        action,
+        None,
+        false,
+    )?;
+    finish_action_boundary(state, raw, PublicFinalizeMode::Immediate)
 }
 
 /// Simulation-apply variant of [`apply_as_current`] for throwaway clones that

@@ -17992,12 +17992,17 @@ pub struct ResolutionPaymentTransaction {
     pub resolving_trigger_context: Option<ResolvingTriggerContext>,
 }
 
-/// One admitted action in a staged payment transaction. `actor` is the
-/// authenticated submitter at the action boundary; replay derives the
-/// semantic owner from the same waiting/control state that admitted it.
+/// One admitted action in a staged payment transaction. Both halves of the
+/// original interaction boundary are durable: the authenticated submitter is
+/// retained for audit, while the semantic owner freezes the decision slot that
+/// was admitted. Replay uses that frozen owner instead of re-authorizing the
+/// historical submitter against a later control topology.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ResolutionPaymentTranscriptEntry {
-    pub actor: PlayerId,
+    #[serde(alias = "actor")]
+    pub authenticated_actor: PlayerId,
+    #[serde(default)]
+    pub semantic_owner: PlayerId,
     pub action: GameAction,
 }
 

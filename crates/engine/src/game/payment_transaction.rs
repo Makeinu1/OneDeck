@@ -180,7 +180,12 @@ fn replay(
 
     for entry in &transaction.transcript {
         restore_trigger_context(&mut shadow, transaction.resolving_trigger_context.as_ref());
-        let result = engine::apply_recorded_action(&mut shadow, entry.actor, entry.action.clone())?;
+        let result = engine::apply_admitted_recorded_action(
+            &mut shadow,
+            entry.authenticated_actor,
+            entry.semantic_owner,
+            entry.action.clone(),
+        )?;
         buffered_events.extend(result.events);
         buffered_log_entries.extend(result.log_entries);
         if shadow.cost_payment_failed_flag {
@@ -250,9 +255,19 @@ pub(crate) fn apply_pending_action(
         .ok_or_else(|| EngineError::InvalidAction("no staged payment transaction".to_string()))?
         .as_ref()
         .clone();
+    let semantic_owner = state
+        .waiting_for
+        .acting_players()
+        .first()
+        .copied()
+        .unwrap_or(transaction.owner);
     transaction
         .transcript
-        .push(ResolutionPaymentTranscriptEntry { actor, action });
+        .push(ResolutionPaymentTranscriptEntry {
+            authenticated_actor: actor,
+            semantic_owner,
+            action,
+        });
 
     match replay(state, &transaction)? {
         ReplayOutcome::Failed => {
@@ -350,19 +365,11 @@ pub(crate) fn project(state: &GameState) -> GameState {
 /// Materialize the canonical, uncommitted base for an unscoped client wire.
 ///
 /// A `ClientGameStateRef` without a viewer has no authenticated actor and must
-/// never replay a staged transaction merely to serialize it. Route the
-/// canonical base through the existing non-seat spectator projection so hidden
-/// identities and private continuation carriers are redacted by the shared
-/// visibility authority while the public `WaitingFor` remains usable. Trusted
-/// internal callers that need the full shadow use [`project`] directly and do
-/// not cross the client serialization boundary.
+/// never replay a staged transaction merely to serialize it. The caller routes
+/// this base through the explicit unseated visibility projection; keeping the
+/// payment boundary here free of a fabricated `PlayerId` prevents topology
+/// lookups from accidentally granting private access.
 pub(crate) fn project_without_viewer(state: &GameState) -> GameState {
-    if state.payment_transaction.is_some() {
-        return crate::game::visibility::filter_state_for_viewer(
-            state,
-            crate::types::player::PlayerId(u8::MAX),
-        );
-    }
     let mut base = state.clone();
     base.payment_transaction = None;
     base.payment_transaction_replay = false;
@@ -426,8 +433,11 @@ pub(crate) fn abandon_for_owner_departure(
 /// Whether the transaction path should own this action. Actor-scoped display,
 /// debug/capability, concession, and unrelated global actions remain ordinary
 /// reducer actions while a payment prompt is open. For the remaining actions,
-/// reuse the ordinary reducer on a throwaway canonical clone as the admission
-/// authority instead of maintaining a second `(WaitingFor, GameAction)` table.
+/// materialize the current replay shadow and reuse the ordinary reducer as the
+/// admission authority instead of maintaining a second `(WaitingFor,
+/// GameAction)` table. The shadow is required here because prompts such as a
+/// replacement choice carry transient continuation records that deliberately do
+/// not live on the canonical pre-payment state.
 pub(crate) fn owns_action(state: &GameState, action: &GameAction) -> bool {
     let Some(transaction) = state.payment_transaction.as_ref() else {
         return false;
@@ -447,9 +457,11 @@ pub(crate) fn owns_action(state: &GameState, action: &GameAction) -> bool {
         .copied()
         .unwrap_or(transaction.owner);
     let actor = crate::game::turn_control::authorized_submitter_for_player(state, semantic_owner);
-    let mut probe = state.clone();
-    // The probe must exercise the ordinary WaitingFor/action authority, not
-    // recursively re-enter this transaction or create a nested descriptor.
+    let mut probe = project(state);
+    // The probe must exercise the ordinary WaitingFor/action authority on the
+    // materialized shadow, not recursively re-enter this transaction or create
+    // a nested descriptor. `project` has already cleared the transaction and
+    // transient guards while preserving the prompt's continuation payload.
     probe.payment_transaction = None;
     probe.payment_transaction_replay = true;
     probe.payment_transaction_just_handled = false;
@@ -494,7 +506,8 @@ mod tests {
                 crate::types::player::PlayerId(0),
             )),
             transcript: vec![ResolutionPaymentTranscriptEntry {
-                actor: PlayerId(1),
+                authenticated_actor: PlayerId(1),
+                semantic_owner: PlayerId(0),
                 action: GameAction::PassPriority,
             }],
             base_waiting_for: crate::types::game_state::WaitingFor::Priority {
@@ -513,9 +526,66 @@ mod tests {
         assert!(!restored.payment_transaction_replay);
         assert!(!restored.payment_transaction_just_handled);
         assert_eq!(
-            restored.payment_transaction.as_ref().unwrap().transcript[0].actor,
+            restored.payment_transaction.as_ref().unwrap().transcript[0].authenticated_actor,
             PlayerId(1)
         );
+    }
+
+    #[test]
+    fn unseated_wire_hides_hero_hand_in_one_vs_many_staged_payment() {
+        let mut state = GameState::new(crate::types::format::FormatConfig::archenemy(), 4, 42);
+        let hero_card = create_object(
+            &mut state,
+            CardId(920),
+            PlayerId(1),
+            "R5 OneVsMany hero hand card".to_string(),
+            Zone::Hand,
+        );
+        state.waiting_for = crate::types::game_state::WaitingFor::Priority {
+            player: PlayerId(0),
+        };
+        let root = crate::types::ability::ResolvedAbility::new(
+            crate::types::ability::Effect::GenericEffect {
+                static_abilities: Vec::new(),
+                duration: None,
+                target: None,
+                end_cost: None,
+            },
+            Vec::new(),
+            ObjectId(921),
+            PlayerId(0),
+        );
+        state.payment_transaction = Some(Box::new(ResolutionPaymentTransaction {
+            wire_version: 1,
+            owner: PlayerId(0),
+            root: Box::new(root),
+            transcript: Vec::new(),
+            base_waiting_for: state.waiting_for.clone(),
+            resolving_trigger_context: None,
+        }));
+
+        let wire = serde_json::to_value(crate::game::derived_views::ClientGameStateRef::wrap(
+            &state, None,
+        ))
+        .expect("unseated OneVsMany wire projection");
+        assert_eq!(
+            wire["state"]["objects"][hero_card.0.to_string()]["name"],
+            "Hidden Card"
+        );
+        assert!(
+            !wire.to_string().contains("R5 OneVsMany hero hand card"),
+            "unseated wire leaked a hero hand identity: {wire}"
+        );
+        assert!(wire["state"].get("payment_transaction").is_none());
+        assert!(matches!(
+            serde_json::from_value::<crate::types::game_state::WaitingFor>(
+                wire["state"]["waiting_for"].clone()
+            )
+            .expect("public WaitingFor remains decodable"),
+            crate::types::game_state::WaitingFor::Priority {
+                player: PlayerId(0)
+            }
+        ));
     }
 
     fn life_composite_case(life: i32) -> (GameState, ResolvedAbility) {
@@ -1088,7 +1158,7 @@ mod tests {
                 .as_ref()
                 .expect("transaction remains paused")
                 .transcript[0]
-                .actor,
+                .authenticated_actor,
             PlayerId(0)
         );
         assert!(matches!(
@@ -1349,6 +1419,148 @@ mod tests {
             filtered.waiting_for,
             crate::types::game_state::WaitingFor::ChooseOneOfBranch { .. }
         ));
+    }
+
+    #[test]
+    fn admitted_controller_choice_replays_after_controller_concedes() {
+        let mut state = GameState::new(crate::types::format::FormatConfig::standard(), 3, 42);
+        state.turn_decision_controller = Some(PlayerId(1));
+        state.turn_decision_control_timestamp = Some(0);
+        state
+            .scheduled_turn_controls
+            .push(crate::types::game_state::ScheduledTurnControl {
+                target_player: PlayerId(0),
+                controller: PlayerId(1),
+                timestamp: 0,
+                grant_extra_turn_after: false,
+                window: crate::types::ability::ControlWindow::NextTurn,
+            });
+        state.players[0].energy = 1;
+        let card = create_object(
+            &mut state,
+            CardId(922),
+            PlayerId(0),
+            "R5 controller departure payment card".to_string(),
+            Zone::Hand,
+        );
+        create_object(
+            &mut state,
+            CardId(923),
+            PlayerId(0),
+            "R5 controller departure alternate".to_string(),
+            Zone::Hand,
+        );
+        let source = create_object(
+            &mut state,
+            CardId(924),
+            PlayerId(0),
+            "R5 controller departure source".to_string(),
+            Zone::Battlefield,
+        );
+        let replacement_choice = AbilityDefinition::new(
+            AbilityKind::Spell,
+            Effect::ChooseOneOf {
+                chooser: PlayerFilter::Controller,
+                branches: vec![AbilityDefinition::new(
+                    AbilityKind::Spell,
+                    Effect::GainLife {
+                        amount: QuantityExpr::Fixed { value: 1 },
+                        player: TargetFilter::Controller,
+                    },
+                )],
+            },
+        );
+        state
+            .objects
+            .get_mut(&source)
+            .expect("departure source")
+            .replacement_definitions = vec![ReplacementDefinition::new(ReplacementEvent::LoseLife)
+            .quantity_modification(QuantityModification::Plus { value: 0 })
+            .execute(replacement_choice)]
+        .into();
+
+        let root = ResolvedAbility::new(
+            Effect::PayCost {
+                cost: AbilityCost::Composite {
+                    costs: vec![
+                        AbilityCost::Discard {
+                            count: QuantityExpr::Fixed { value: 1 },
+                            filter: None,
+                            selection: crate::types::ability::CardSelectionMode::Chosen,
+                            self_scope: crate::types::ability::DiscardSelfScope::FromHand,
+                        },
+                        AbilityCost::Mana {
+                            cost: ManaCost::Cost {
+                                shards: vec![ManaCostShard::PhyrexianBlack],
+                                generic: 0,
+                            },
+                        },
+                        AbilityCost::PayEnergy {
+                            amount: QuantityExpr::Fixed { value: 1 },
+                        },
+                    ],
+                },
+                scale: None,
+                payer: TargetFilter::Controller,
+            },
+            Vec::new(),
+            source,
+            PlayerId(0),
+        );
+        let mut events = Vec::new();
+        effects::resolve_ability_chain(&mut state, &root, &mut events, 0)
+            .expect("controlled payment reaches its first choice");
+        assert!(matches!(
+            state.waiting_for,
+            crate::types::game_state::WaitingFor::DiscardChoice { .. }
+        ));
+
+        crate::game::engine::apply_as_current(
+            &mut state,
+            GameAction::SelectCards { cards: vec![card] },
+        )
+        .expect("controller submits the admitted discard");
+        let transaction = state
+            .payment_transaction
+            .as_ref()
+            .expect("payment remains staged after the first choice");
+        assert_eq!(transaction.transcript.len(), 1);
+        assert_eq!(transaction.transcript[0].authenticated_actor, PlayerId(1));
+        assert_eq!(transaction.transcript[0].semantic_owner, PlayerId(0));
+        assert!(matches!(
+            state.waiting_for,
+            crate::types::game_state::WaitingFor::ChooseOneOfBranch { .. }
+        ));
+
+        crate::game::engine::apply(
+            &mut state,
+            PlayerId(1),
+            GameAction::Concede {
+                player_id: PlayerId(1),
+            },
+        )
+        .expect("controller departure is independent of the payer transaction");
+        assert!(state.payment_transaction.is_some());
+        assert!(state.players.iter().any(|player| player.id == PlayerId(0)));
+
+        let resumed = crate::game::engine::apply(
+            &mut state,
+            PlayerId(0),
+            GameAction::ChooseBranch { index: 0 },
+        )
+        .expect("payer finishes after controller departure");
+        assert!(state.payment_transaction.is_none());
+        assert_eq!(state.objects[&card].zone, Zone::Graveyard);
+        assert_eq!(state.players[0].energy, 0);
+        assert_eq!(
+            resumed
+                .events
+                .iter()
+                .filter(|event| matches!(event, GameEvent::ZoneChanged { object_id, .. } if *object_id == card))
+                .count(),
+            1,
+            "the accepted controller choice replays once after departure"
+        );
     }
 
     #[test]
