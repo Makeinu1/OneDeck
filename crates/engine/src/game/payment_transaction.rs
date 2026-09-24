@@ -14,6 +14,7 @@ use crate::types::actions::GameAction;
 use crate::types::events::GameEvent;
 use crate::types::game_state::{
     ActionResult, GameState, ResolutionPaymentTransaction, ResolutionPaymentTranscriptEntry,
+    ResolvingTriggerContext,
 };
 use crate::types::log::GameLogEntry;
 
@@ -36,6 +37,47 @@ fn replay_error(error: EffectError) -> EngineError {
     ))
 }
 
+/// The transaction boundary owns only the Composite PayCost instruction. All
+/// outgoing chain edges stay on the durable root so the ordinary chain walker
+/// can resume them after the payment commits or aborts.
+fn payment_only_root(ability: &ResolvedAbility) -> ResolvedAbility {
+    let mut payment = ability.clone();
+    payment.sub_ability = None;
+    payment.else_ability = None;
+    payment
+}
+
+fn restore_trigger_context(state: &mut GameState, context: Option<&ResolvingTriggerContext>) {
+    let Some(context) = context else {
+        return;
+    };
+    state.current_trigger_event = context.event.clone();
+    state.current_trigger_events = context.events.clone();
+    state.current_trigger_match_count = context.match_count;
+    state.die_result_this_resolution = context.die_result;
+}
+
+fn returned_to_base_waiting(
+    state: &GameState,
+    base_waiting_for: &crate::types::game_state::WaitingFor,
+) -> bool {
+    if state.waiting_for == *base_waiting_for {
+        return true;
+    }
+    // A recorded answer is submitted by the authorized controller, so the
+    // ordinary priority handoff may name that submitter rather than the seat
+    // that held priority before the resolution began. Both are the same settled
+    // priority boundary; a live continuation is the discriminator for a still-
+    // paused payment.
+    matches!(
+        (&state.waiting_for, base_waiting_for),
+        (
+            crate::types::game_state::WaitingFor::Priority { .. },
+            crate::types::game_state::WaitingFor::Priority { .. }
+        )
+    ) && state.active_ability_continuation().is_none()
+}
+
 /// Begin a staged transaction from the resolution-time `PayCost` authority.
 ///
 /// The caller has not yet committed any payment mutation. The root is replayed
@@ -47,12 +89,15 @@ pub(crate) fn begin(
     events: &mut Vec<GameEvent>,
 ) -> Result<(), EffectError> {
     let base = state.clone();
+    let resolving_trigger_context = ResolvingTriggerContext::capture(&base);
     let mut shadow = base.clone();
     shadow.payment_transaction = None;
     shadow.payment_transaction_replay = true;
     shadow.payment_transaction_just_handled = false;
     let mut buffered_events = Vec::new();
-    effects::resolve_ability_chain(&mut shadow, ability, &mut buffered_events, 0)?;
+    let payment_root = payment_only_root(ability);
+    effects::resolve_ability_chain(&mut shadow, &payment_root, &mut buffered_events, 0)?;
+    restore_trigger_context(&mut shadow, resolving_trigger_context.as_ref());
     shadow.payment_transaction_replay = false;
 
     // A failed composite owns no partial payment and produces no payment events.
@@ -68,13 +113,13 @@ pub(crate) fn begin(
         return Ok(());
     }
 
-    // A synchronous success can commit the shadow atomically. The chain walker
-    // consumes `payment_transaction_just_handled` and returns before it can walk
-    // the same rider a second time.
+    // A synchronous success can commit the payment shadow atomically. Leave the
+    // transient handoff flag clear so the *ordinary* chain walker continues into
+    // the printed rider outside this transaction boundary.
     if shadow.waiting_for == base.waiting_for {
         shadow.payment_transaction = None;
         shadow.payment_transaction_replay = false;
-        shadow.payment_transaction_just_handled = true;
+        shadow.payment_transaction_just_handled = false;
         *state = shadow;
         events.extend(buffered_events);
         return Ok(());
@@ -95,6 +140,7 @@ pub(crate) fn begin(
         root: Box::new(ability.clone()),
         transcript: Vec::new(),
         base_waiting_for: base.waiting_for.clone(),
+        resolving_trigger_context,
     };
     *state = base;
     state.payment_transaction = Some(Box::new(transaction));
@@ -115,11 +161,14 @@ fn replay(
     shadow.payment_transaction_just_handled = false;
     shadow.cost_payment_failed_flag = false;
     shadow.waiting_for = transaction.base_waiting_for.clone();
+    restore_trigger_context(&mut shadow, transaction.resolving_trigger_context.as_ref());
 
     let mut buffered_events = Vec::new();
     let mut buffered_log_entries: Vec<GameLogEntry> = Vec::new();
-    effects::resolve_ability_chain(&mut shadow, &transaction.root, &mut buffered_events, 0)
+    let payment_root = payment_only_root(&transaction.root);
+    effects::resolve_ability_chain(&mut shadow, &payment_root, &mut buffered_events, 0)
         .map_err(replay_error)?;
+    restore_trigger_context(&mut shadow, transaction.resolving_trigger_context.as_ref());
     // Keep the replay guard live while transcript actions drain the suspended
     // continuation. A remaining Composite must use the ordinary sequential
     // shadow authority, never open a nested descriptor of its own.
@@ -130,6 +179,7 @@ fn replay(
     }
 
     for entry in &transaction.transcript {
+        restore_trigger_context(&mut shadow, transaction.resolving_trigger_context.as_ref());
         let result = engine::apply_recorded_action(&mut shadow, entry.actor, entry.action.clone())?;
         buffered_events.extend(result.events);
         buffered_log_entries.extend(result.log_entries);
@@ -137,11 +187,12 @@ fn replay(
             return Ok(ReplayOutcome::Failed);
         }
         shadow.payment_transaction_replay = true;
+        restore_trigger_context(&mut shadow, transaction.resolving_trigger_context.as_ref());
     }
 
     shadow.payment_transaction_replay = false;
 
-    if shadow.waiting_for == transaction.base_waiting_for {
+    if returned_to_base_waiting(&shadow, &transaction.base_waiting_for) {
         Ok(ReplayOutcome::Completed {
             shadow,
             events: buffered_events,
@@ -152,24 +203,34 @@ fn replay(
     }
 }
 
-/// Resume only the printed continuation after a staged payment abort.
+/// Resume only the printed continuation after a staged payment boundary.
 ///
 /// The replay shadow has already evaluated the payment root and is discarded
 /// on failure. Re-entering the original root would pay/choose again, so hand
 /// the root's first child to the ordinary chain walker with the canonical
 /// payment-failure signal. Its existing condition/sibling logic then suppresses
 /// IfYouDo/WhenYouDo clauses and executes unconditional sequential siblings.
-fn resolve_abort_continuation(
+fn resolve_root_continuation(
     state: &mut GameState,
     root: &ResolvedAbility,
+    payment_succeeded: bool,
+    resolving_trigger_context: Option<&ResolvingTriggerContext>,
     events: &mut Vec<GameEvent>,
 ) -> Result<(), EngineError> {
     let Some(sub) = root.sub_ability.as_deref() else {
         return Ok(());
     };
+    // The ordinary parent-to-child handoff records whether this PayCost
+    // instruction actually performed. A staged replay evaluates the payment
+    // root without its rider, so carry the same outcome bit onto the synthetic
+    // parent context before re-entering the existing chain authority. The
+    // child still owns all SubAbilityLink/condition/else evaluation.
+    let mut parent = root.clone();
+    parent.context.optional_effect_performed |= payment_succeeded;
     let mut continuation = sub.clone();
-    effects::apply_parent_chain_context(&mut continuation, root, None, state);
-    effects::resolve_ability_chain(state, &continuation, events, 0).map_err(replay_error)
+    effects::apply_parent_chain_context(&mut continuation, &parent, None, state);
+    restore_trigger_context(state, resolving_trigger_context);
+    effects::resolve_ability_chain(state, &continuation, events, 1).map_err(replay_error)
 }
 
 /// Apply one player action against the live transaction's replayed shadow.
@@ -203,7 +264,13 @@ pub(crate) fn apply_pending_action(
             restored.cost_payment_failed_flag = true;
             *state = restored;
             let mut continuation_events = Vec::new();
-            resolve_abort_continuation(state, &transaction.root, &mut continuation_events)?;
+            resolve_root_continuation(
+                state,
+                &transaction.root,
+                false,
+                transaction.resolving_trigger_context.as_ref(),
+                &mut continuation_events,
+            )?;
             Ok(ActionResult {
                 events: continuation_events,
                 waiting_for: state.waiting_for.clone(),
@@ -227,13 +294,23 @@ pub(crate) fn apply_pending_action(
         }
         ReplayOutcome::Completed {
             mut shadow,
-            events,
+            mut events,
             log_entries,
         } => {
-            let waiting_for = shadow.waiting_for.clone();
             shadow.payment_transaction = None;
             shadow.payment_transaction_replay = false;
             shadow.payment_transaction_just_handled = false;
+            // The payment is committed. Continue the printed rider through the
+            // ordinary chain walker, now outside the transaction, so a later
+            // pause/failure cannot restore the pre-payment base.
+            resolve_root_continuation(
+                &mut shadow,
+                &transaction.root,
+                true,
+                transaction.resolving_trigger_context.as_ref(),
+                &mut events,
+            )?;
+            let waiting_for = shadow.waiting_for.clone();
             *state = shadow;
             Ok(ActionResult {
                 events,
@@ -305,7 +382,7 @@ pub(crate) fn project_for_viewer(
         return state.clone();
     };
     let shadow = project(state);
-    // CR 103.5 + CR 723.5: shadow access follows the exact submitter set that
+    // CR 723.5: shadow access follows the exact submitter set that
     // admits the next action. A semantic seat is not enough when a controller
     // effect routes its prompt to another actor; fail closed to the canonical
     // base unless the viewer is that currently authorized submitter.
@@ -346,15 +423,37 @@ pub(crate) fn abandon_for_owner_departure(
     }
 }
 
-/// Whether the transaction path should own this action. Actor-scoped display
-/// preferences remain ordinary reducer actions while a payment prompt is open.
+/// Whether the transaction path should own this action. Actor-scoped display,
+/// debug/capability, concession, and unrelated global actions remain ordinary
+/// reducer actions while a payment prompt is open. For the remaining actions,
+/// reuse the ordinary reducer on a throwaway canonical clone as the admission
+/// authority instead of maintaining a second `(WaitingFor, GameAction)` table.
 pub(crate) fn owns_action(state: &GameState, action: &GameAction) -> bool {
-    state.payment_transaction.is_some()
-        && !action.is_actor_scoped_preference()
+    let Some(transaction) = state.payment_transaction.as_ref() else {
+        return false;
+    };
+    if action.is_submitter_scoped()
         // CR 104.3a: concession bypasses every WaitingFor, so it must reach
         // the canonical elimination authority instead of entering the payment
         // transcript as if it were a payment choice.
-        && !matches!(action, GameAction::Concede { .. })
+        || matches!(action, GameAction::Concede { .. })
+    {
+        return false;
+    }
+    let semantic_owner = state
+        .waiting_for
+        .acting_players()
+        .first()
+        .copied()
+        .unwrap_or(transaction.owner);
+    let actor = crate::game::turn_control::authorized_submitter_for_player(state, semantic_owner);
+    let mut probe = state.clone();
+    // The probe must exercise the ordinary WaitingFor/action authority, not
+    // recursively re-enter this transaction or create a nested descriptor.
+    probe.payment_transaction = None;
+    probe.payment_transaction_replay = true;
+    probe.payment_transaction_just_handled = false;
+    crate::game::engine::apply_recorded_action(&mut probe, actor, action.clone()).is_ok()
 }
 
 #[cfg(test)]
@@ -401,6 +500,7 @@ mod tests {
             base_waiting_for: crate::types::game_state::WaitingFor::Priority {
                 player: crate::types::player::PlayerId(0),
             },
+            resolving_trigger_context: None,
         }));
         state.payment_transaction_replay = true;
         state.payment_transaction_just_handled = true;
@@ -592,6 +692,7 @@ mod tests {
             root: Box::new(root),
             transcript: Vec::new(),
             base_waiting_for: state.waiting_for.clone(),
+            resolving_trigger_context: None,
         }));
         (state, hidden_card)
     }
@@ -705,6 +806,154 @@ mod tests {
         gated.sub_ability = Some(Box::new(unconditional));
         root.sub_ability = Some(Box::new(gated));
         (state, root, hidden_card)
+    }
+
+    fn committed_composite_with_failing_rider_case() -> (GameState, ResolvedAbility) {
+        let mut state = GameState::new_two_player(42);
+        state.players[0].life = 10;
+        state.players[0].energy = 0;
+        let source = ObjectId(913);
+        let mut root = ResolvedAbility::new(
+            Effect::PayCost {
+                cost: AbilityCost::Composite {
+                    costs: vec![AbilityCost::PayLife {
+                        amount: QuantityExpr::Fixed { value: 1 },
+                    }],
+                },
+                scale: None,
+                payer: TargetFilter::Controller,
+            },
+            Vec::new(),
+            source,
+            PlayerId(0),
+        );
+        root.sub_ability = Some(Box::new(ResolvedAbility::new(
+            Effect::PayCost {
+                cost: AbilityCost::PayEnergy {
+                    amount: QuantityExpr::Fixed { value: 1 },
+                },
+                scale: None,
+                payer: TargetFilter::Controller,
+            },
+            Vec::new(),
+            source,
+            PlayerId(0),
+        )));
+        (state, root)
+    }
+
+    fn committed_composite_with_pausing_rider_case() -> (GameState, ResolvedAbility, ObjectId) {
+        let mut state = GameState::new_two_player(42);
+        state.players[0].life = 10;
+        state.players[0].energy = 0;
+        let first = create_object(
+            &mut state,
+            CardId(914),
+            PlayerId(0),
+            "R5 rider discard".to_string(),
+            Zone::Hand,
+        );
+        create_object(
+            &mut state,
+            CardId(915),
+            PlayerId(0),
+            "R5 rider alternate".to_string(),
+            Zone::Hand,
+        );
+        let source = ObjectId(916);
+        let mut root = ResolvedAbility::new(
+            Effect::PayCost {
+                cost: AbilityCost::Composite {
+                    costs: vec![AbilityCost::PayLife {
+                        amount: QuantityExpr::Fixed { value: 1 },
+                    }],
+                },
+                scale: None,
+                payer: TargetFilter::Controller,
+            },
+            Vec::new(),
+            source,
+            PlayerId(0),
+        );
+        let mut discard_rider = ResolvedAbility::new(
+            Effect::PayCost {
+                cost: AbilityCost::Discard {
+                    count: QuantityExpr::Fixed { value: 1 },
+                    filter: None,
+                    selection: crate::types::ability::CardSelectionMode::Chosen,
+                    self_scope: crate::types::ability::DiscardSelfScope::FromHand,
+                },
+                scale: None,
+                payer: TargetFilter::Controller,
+            },
+            Vec::new(),
+            source,
+            PlayerId(0),
+        );
+        discard_rider.sub_ability = Some(Box::new(ResolvedAbility::new(
+            Effect::PayCost {
+                cost: AbilityCost::PayEnergy {
+                    amount: QuantityExpr::Fixed { value: 1 },
+                },
+                scale: None,
+                payer: TargetFilter::Controller,
+            },
+            Vec::new(),
+            source,
+            PlayerId(0),
+        )));
+        root.sub_ability = Some(Box::new(discard_rider));
+        (state, root, first)
+    }
+
+    fn trigger_context_composite_case() -> (GameState, ResolvedAbility, ObjectId) {
+        let mut state = GameState::new_two_player(42);
+        state.players[1].life = 20;
+        let first = create_object(
+            &mut state,
+            CardId(917),
+            PlayerId(1),
+            "R5 context discard".to_string(),
+            Zone::Hand,
+        );
+        create_object(
+            &mut state,
+            CardId(918),
+            PlayerId(1),
+            "R5 context alternate".to_string(),
+            Zone::Hand,
+        );
+        state.current_trigger_event = Some(GameEvent::LifeChanged {
+            player_id: PlayerId(1),
+            amount: 3,
+            new_total: crate::types::events::LifeTotalReading::default(),
+        });
+        state.current_trigger_events = state.current_trigger_event.clone().into_iter().collect();
+        let root = ResolvedAbility::new(
+            Effect::PayCost {
+                cost: AbilityCost::Composite {
+                    costs: vec![
+                        AbilityCost::Discard {
+                            count: QuantityExpr::Fixed { value: 1 },
+                            filter: None,
+                            selection: crate::types::ability::CardSelectionMode::Chosen,
+                            self_scope: crate::types::ability::DiscardSelfScope::FromHand,
+                        },
+                        AbilityCost::PayLife {
+                            amount: QuantityExpr::Ref {
+                                qty: crate::types::ability::QuantityRef::EventContextAmount,
+                            },
+                        },
+                    ],
+                },
+                scale: None,
+                payer: TargetFilter::TriggeringPlayer,
+            },
+            Vec::new(),
+            ObjectId(919),
+            PlayerId(0),
+        );
+        (state, root, first)
     }
 
     #[test]
@@ -978,22 +1227,26 @@ mod tests {
             crate::game::visibility::filter_state_for_viewer(&controlled, PlayerId(1));
         assert_eq!(semantic_view.objects[&controlled_card].zone, Zone::Hand);
         assert_eq!(
+            semantic_view.objects[&controlled_card].name,
+            "R5 controller-hidden card"
+        );
+        assert_eq!(
             controller_view.objects[&controlled_card].zone,
             Zone::Graveyard
         );
         assert_eq!(
             controller_view.objects[&controlled_card].name,
-            "Hidden Card"
+            "R5 controller-hidden card"
         );
         let controller_wire = serde_json::to_value(
             crate::game::derived_views::ClientGameStateRef::wrap(&controlled, Some(PlayerId(1))),
         )
         .expect("controller wire projection");
         assert!(
-            !controller_wire
+            controller_wire
                 .to_string()
                 .contains("R5 controller-hidden card"),
-            "authorized controller wire leaked hidden identity: {controller_wire}"
+            "authorized controller wire should retain controlled player's private identity: {controller_wire}"
         );
         let abort = crate::game::engine::apply_as_current(
             &mut controlled,
@@ -1054,6 +1307,10 @@ mod tests {
                 player_id: transaction_owner,
             }
         ));
+        assert!(
+            !owns_action(&concede, &GameAction::PassPriority),
+            "an unrelated non-Concede action must not enter the payment transcript"
+        );
         let concede_result = crate::game::engine::apply_as_current(
             &mut concede,
             GameAction::Concede {
@@ -1092,5 +1349,141 @@ mod tests {
             filtered.waiting_for,
             crate::types::game_state::WaitingFor::ChooseOneOfBranch { .. }
         ));
+    }
+
+    #[test]
+    fn successful_composite_does_not_roll_back_when_later_rider_fails() {
+        let (mut state, root) = committed_composite_with_failing_rider_case();
+        let mut events = Vec::new();
+        effects::resolve_ability_chain(&mut state, &root, &mut events, 0)
+            .expect("composite and rider resolution");
+
+        assert_eq!(
+            state.players[0].life, 9,
+            "the committed payment stays committed"
+        );
+        assert_eq!(state.players[0].energy, 0);
+        assert!(state.payment_transaction.is_none());
+        assert!(state.cost_payment_failed_flag);
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(event, GameEvent::LifeChanged { amount: -1, .. }))
+                .count(),
+            1,
+            "the successful Composite emits its event exactly once"
+        );
+    }
+
+    #[test]
+    fn successful_composite_stays_committed_across_later_rider_pause_and_failure() {
+        let (mut state, root, card) = committed_composite_with_pausing_rider_case();
+        let mut events = Vec::new();
+        effects::resolve_ability_chain(&mut state, &root, &mut events, 0)
+            .expect("composite and rider reach discard choice");
+
+        assert_eq!(state.players[0].life, 9);
+        assert!(state.payment_transaction.is_none());
+        let rider_continuation = state
+            .active_ability_continuation()
+            .expect("ordinary rider pause must own its continuation");
+        assert!(matches!(
+            rider_continuation.chain.effect,
+            Effect::PayCost {
+                cost: AbilityCost::PayEnergy { .. },
+                ..
+            }
+        ));
+        assert!(matches!(
+            state.waiting_for,
+            crate::types::game_state::WaitingFor::DiscardChoice { .. }
+        ));
+        crate::game::engine::apply_as_current(
+            &mut state,
+            GameAction::SelectCards { cards: vec![card] },
+        )
+        .expect("ordinary rider discard choice");
+        assert_eq!(
+            state.players[0].life, 9,
+            "rider failure cannot restore the old base"
+        );
+        assert!(state.payment_transaction.is_none());
+        assert!(state.cost_payment_failed_flag);
+    }
+
+    #[test]
+    fn staged_payment_restores_trigger_context_after_serde_roundtrip() {
+        let (mut state, mut root, card) = trigger_context_composite_case();
+        let mut success_rider = ResolvedAbility::new(
+            Effect::GainLife {
+                amount: QuantityExpr::Fixed { value: 2 },
+                player: TargetFilter::Controller,
+            },
+            Vec::new(),
+            root.source_id,
+            root.controller,
+        );
+        success_rider.condition = Some(AbilityCondition::EffectOutcome {
+            signal: EffectOutcomeSignal::OptionalEffectPerformed,
+        });
+        root.sub_ability = Some(Box::new(success_rider));
+        let mut events = Vec::new();
+        effects::resolve_ability_chain(&mut state, &root, &mut events, 0)
+            .expect("context-dependent composite reaches discard choice");
+        let transaction = state
+            .payment_transaction
+            .as_ref()
+            .expect("context-dependent payment is staged");
+        assert_eq!(transaction.owner, PlayerId(1));
+        assert!(transaction.resolving_trigger_context.is_some());
+        assert!(matches!(
+            state.waiting_for,
+            crate::types::game_state::WaitingFor::DiscardChoice {
+                player: PlayerId(1),
+                ..
+            }
+        ));
+
+        let serialized = serde_json::to_value(&state).expect("state serializes");
+        let mut restored: GameState = serde_json::from_value(serialized).expect("state restores");
+        // The live fields may be present in a local snapshot, but a persisted
+        // server pause resumes after the stack driver has cleared them. Make
+        // that boundary explicit so this witness proves the durable descriptor
+        // is the source of truth for payer/amount context.
+        restored.current_trigger_event = None;
+        restored.current_trigger_events.clear();
+        let resume = crate::game::engine::apply_as_current(
+            &mut restored,
+            GameAction::SelectCards { cards: vec![card] },
+        )
+        .expect("restored context resumes the staged payment");
+
+        assert_eq!(restored.players[1].life, 17);
+        assert_eq!(
+            restored.players[0].life, 22,
+            "a successful staged payment must re-enter the ordinary parent-to-rider outcome gate"
+        );
+        assert_eq!(restored.objects[&card].zone, Zone::Graveyard);
+        assert!(restored.payment_transaction.is_none());
+        assert!(matches!(
+            restored.waiting_for,
+            crate::types::game_state::WaitingFor::Priority { .. }
+        ));
+        assert_eq!(
+            resume
+                .events
+                .iter()
+                .filter(|event| matches!(
+                    event,
+                    GameEvent::LifeChanged {
+                        player_id: PlayerId(1),
+                        amount: -3,
+                        ..
+                    }
+                ))
+                .count(),
+            1,
+            "the restored EventContextAmount drives the same life payment"
+        );
     }
 }

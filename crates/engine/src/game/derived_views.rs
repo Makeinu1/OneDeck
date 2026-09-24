@@ -1140,10 +1140,10 @@ impl<'a> ClientGameStateRef<'a> {
                 .filter_map(|(id, object)| object.display_visible_to_viewer.then_some(*id))
                 .collect()
         });
-        let mut derived = derive_views(state, viewer);
-        if let Some(filtered) = filtered_state.as_ref() {
-            derived.visible_exile_object_ids = visible_exile_object_ids(filtered);
-        }
+        let derived = match filtered_state.as_ref() {
+            Some(filtered) => derive_filtered_views(state, filtered, viewer),
+            None => derive_views(state, viewer),
+        };
         Self {
             state,
             derived,

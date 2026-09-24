@@ -1053,7 +1053,7 @@ pub fn filter_state_for_viewer(state: &GameState, viewer: PlayerId) -> GameState
                         || state.revealed_cards.contains(object_id)
                         || state.public_revealed_cards.contains(object_id);
                     (crossed_hidden_boundary
-                        && base_object.owner != viewer
+                        && !viewer_has_private_access_to_player(state, viewer, base_object.owner)
                         && !identity_already_known)
                         .then_some(*object_id)
                 })
@@ -2420,7 +2420,7 @@ pub fn filter_state_for_viewer(state: &GameState, viewer: PlayerId) -> GameState
 /// information visible to that player; when turns are shared, controlling one
 /// player controls that player's team. Reuse submitter authority so the same
 /// team-turn boundary governs decisions and private information.
-fn viewer_has_private_access_to_player(
+pub(crate) fn viewer_has_private_access_to_player(
     state: &GameState,
     viewer: PlayerId,
     player: PlayerId,
