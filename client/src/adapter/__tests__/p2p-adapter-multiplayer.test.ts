@@ -2182,14 +2182,23 @@ describe("P2PHostAdapter — 3-4p multiplayer", () => {
     mockSubmitAction.mockClear();
     mockGetViewerSnapshot.mockClear();
     mockGetViewerTransitionSnapshot.mockClear();
+    const firstResult = {
+      events: [firstEvent],
+      log_entries: [firstLog],
+    };
+    const secondResult = {
+      events: [secondEvent],
+      log_entries: [secondLog],
+    };
     mockSubmitAction
-      .mockResolvedValueOnce({ events: [firstEvent], log_entries: [firstLog] })
-      .mockResolvedValueOnce({ events: [secondEvent], log_entries: [secondLog] });
-    mockGetViewerSnapshot.mockImplementation(async () => ({
+      .mockResolvedValueOnce(firstResult)
+      .mockResolvedValueOnce(secondResult);
+    const currentViewerSnapshot = {
       state: remoteState("state-2"),
       actions: [secondAction],
       autoPassRecommended: false,
-    }));
+    } as unknown as Awaited<ReturnType<typeof mockGetViewerSnapshot>>;
+    mockGetViewerSnapshot.mockImplementation(async () => currentViewerSnapshot);
     mockGetViewerTransitionSnapshot
       .mockImplementationOnce(async () => {
         firstSnapshotStarted.resolve();
@@ -2199,14 +2208,14 @@ describe("P2PHostAdapter — 3-4p multiplayer", () => {
           actions: [secondAction],
           autoPassRecommended: false,
           events: [firstEvent],
-        };
+        } as unknown as Awaited<ReturnType<typeof mockGetViewerTransitionSnapshot>>;
       })
       .mockImplementationOnce(async () => ({
         state: remoteState("state-2"),
         actions: [secondAction],
         autoPassRecommended: false,
         events: [secondEvent],
-      }));
+      } as unknown as Awaited<ReturnType<typeof mockGetViewerTransitionSnapshot>>));
 
     const first = adapter.submitAction(firstAction, 0);
     await firstSnapshotStarted.promise;
