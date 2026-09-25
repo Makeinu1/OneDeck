@@ -32,15 +32,17 @@ use engine::game::deck_validation::{draft_set_concessions_for, evaluate_deck_for
 use engine::game::CardDbRehydrationFinalization;
 use engine::game::{
     can_pair_commanders, companion_candidates, deck_copy_limit_for, estimate_bracket,
-    evaluate_deck_compatibility, filter_state_for_viewer, is_brawl_commander_eligible,
-    is_commander_eligible, is_freeform_commander_eligible, is_tiny_leader_eligible,
-    load_and_hydrate_decks, max_deck_copies, rehydrate_game_from_card_db_with_finalization,
-    resolve_deck_list, signature_spell_selection_policy, start_game,
-    start_game_with_starting_player, validate_name_deck_for_format_full, BracketEstimate,
-    DeckCompatibilityRequest, DeckList, PlayerDeckList, ReplayPlayer,
+    evaluate_deck_compatibility, filter_events_for_viewer, filter_state_for_viewer,
+    is_brawl_commander_eligible, is_commander_eligible, is_freeform_commander_eligible,
+    is_tiny_leader_eligible, load_and_hydrate_decks, max_deck_copies,
+    rehydrate_game_from_card_db_with_finalization, resolve_deck_list,
+    signature_spell_selection_policy, start_game, start_game_with_starting_player,
+    validate_name_deck_for_format_full, BracketEstimate, DeckCompatibilityRequest, DeckList,
+    PlayerDeckList, ReplayPlayer,
 };
 use engine::types::actions::{DebugAction, DebugCardCreationKind};
 use engine::types::custom_format::{CustomFormatDef, CustomFormatRules};
+use engine::types::events::GameEvent;
 use engine::types::format::{
     validate_starting_life_bounds, DeckCopyLimit, FormatConfig, GameFormat,
 };
@@ -539,6 +541,13 @@ struct LegalActionsResult {
     #[serde(skip_serializing_if = "Option::is_none")]
     stuck_diagnostic: Option<engine::ai_support::StuckDecisionDiagnostic>,
     viewer_interaction: engine::types::interaction::ViewerInteraction,
+}
+
+/// Reject viewer IDs that cannot be represented by the engine's `PlayerId`.
+fn viewer_player_id(player_id: u32) -> Result<PlayerId, String> {
+    u8::try_from(player_id)
+        .map(PlayerId)
+        .map_err(|_| format!("INVALID_VIEWER_ID: {player_id} exceeds u8 range"))
 }
 
 /// Convert engine object IDs into the string-keyed records JSON requires at the
@@ -2317,12 +2326,13 @@ pub fn get_legal_actions_js() -> JsValue {
 /// game logic into the transport adapter.
 #[wasm_bindgen]
 pub fn get_legal_actions_for_viewer_js(player_id: u32) -> JsValue {
+    let viewer = match viewer_player_id(player_id) {
+        Ok(viewer) => viewer,
+        Err(error) => return JsValue::from_str(&error),
+    };
     match with_state_mut(|state| {
         engine::game::layers::flush_layers(state);
-        to_js(&legal_actions_result_for_viewer(
-            state,
-            PlayerId(player_id as u8),
-        ))
+        to_js(&legal_actions_result_for_viewer(state, viewer))
     }) {
         Ok(val) => val,
         Err(_) => JsValue::NULL,
@@ -2393,6 +2403,10 @@ struct ViewerSnapshot<'a> {
     #[serde(skip_serializing_if = "Option::is_none")]
     stuck_diagnostic: Option<engine::ai_support::StuckDecisionDiagnostic>,
     viewer_interaction: engine::types::interaction::ViewerInteraction,
+    /// Events projected through the engine's viewer-visibility authority.
+    /// Absent for the legacy state-only snapshot endpoint.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    events: Option<Vec<GameEvent>>,
 }
 
 fn legal_actions_result_for_viewer(state: &GameState, viewer: PlayerId) -> LegalActionsResult {
@@ -2481,13 +2495,46 @@ mod viewer_priority_tests {
             "normal P2P must not receive the debug-library capability"
         );
     }
+
+    #[test]
+    fn viewer_player_id_rejects_values_that_would_wrap() {
+        assert_eq!(
+            viewer_player_id(255).expect("u8 max is valid"),
+            PlayerId(255)
+        );
+        let error = viewer_player_id(256).expect_err("viewer IDs must not wrap to seat zero");
+        assert_eq!(error, "INVALID_VIEWER_ID: 256 exceeds u8 range");
+    }
+
+    #[test]
+    fn production_transition_snapshot_filters_events_for_each_viewer() {
+        let mut state = GameState::new_two_player(42);
+        let event = GameEvent::CardDrawn {
+            player_id: PlayerId(0),
+            object_id: ObjectId(99),
+            nth_in_turn: 1,
+            nth_in_step: 1,
+        };
+
+        let opponent = viewer_transition_snapshot(&mut state, PlayerId(1), vec![event.clone()]);
+        assert_eq!(opponent["events"], serde_json::json!([]));
+
+        let owner = viewer_transition_snapshot(&mut state, PlayerId(0), vec![event.clone()]);
+        assert_eq!(
+            owner["events"],
+            serde_json::to_value(vec![event]).expect("event serializes")
+        );
+    }
 }
 
 #[wasm_bindgen]
 pub fn get_viewer_snapshot_js(player_id: u32) -> JsValue {
+    let viewer = match viewer_player_id(player_id) {
+        Ok(viewer) => viewer,
+        Err(error) => return JsValue::from_str(&error),
+    };
     match with_state_mut(|state| {
         engine::game::layers::flush_layers(state);
-        let viewer = PlayerId(player_id as u8);
         let filtered = filter_state_for_viewer(state, viewer);
         let legal = legal_actions_result_for_viewer(state, viewer);
         let viewer_interaction =
@@ -2507,8 +2554,65 @@ pub fn get_viewer_snapshot_js(player_id: u32) -> JsValue {
             activation_block_reasons: legal.activation_block_reasons,
             stuck_diagnostic: legal.stuck_diagnostic,
             viewer_interaction,
+            events: None,
         })
     }) {
+        Ok(val) => val,
+        Err(_) => JsValue::NULL,
+    }
+}
+
+/// Build the combined viewer-scoped transition projection used by browser-host
+/// P2P. This keeps state, legal actions, interaction authority, and filtered
+/// events on one engine read so transport cannot pair filtered state with raw
+/// hidden-information events.
+fn viewer_transition_snapshot(
+    state: &mut GameState,
+    viewer: PlayerId,
+    events: Vec<GameEvent>,
+) -> serde_json::Value {
+    engine::game::layers::flush_layers(state);
+    let filtered = filter_state_for_viewer(state, viewer);
+    let legal = legal_actions_result_for_viewer(state, viewer);
+    let viewer_interaction =
+        engine::game::interaction::derive_viewer_interaction(state, &filtered, viewer);
+    let filtered_events = filter_events_for_viewer(&events, state, viewer);
+    serde_json::to_value(ViewerSnapshot {
+        state: engine::game::derived_views::ClientGameStateRef::wrap_filtered(
+            state,
+            &filtered,
+            Some(viewer),
+        ),
+        actions: legal.actions,
+        auto_pass_recommended: legal.auto_pass_recommended,
+        end_continuous_effect_offers: legal.end_continuous_effect_offers,
+        mana_payment_shortcut_actions: legal.mana_payment_shortcut_actions,
+        spell_costs: legal.spell_costs,
+        legal_actions_by_object: legal.legal_actions_by_object,
+        activation_block_reasons: legal.activation_block_reasons,
+        stuck_diagnostic: legal.stuck_diagnostic,
+        viewer_interaction,
+        events: Some(filtered_events),
+    })
+    .expect("viewer transition snapshot serializes")
+}
+
+/// Combined viewer-scoped transition projection used by browser-host P2P.
+#[wasm_bindgen]
+pub fn get_viewer_transition_snapshot_js(player_id: u32, events: JsValue) -> JsValue {
+    let events: Vec<GameEvent> = match serde_wasm_bindgen::from_value(events) {
+        Ok(events) => events,
+        Err(error) => {
+            return JsValue::from_str(&format!(
+                "INVALID_TRANSITION_EVENTS: transition event payload could not be decoded: {error}"
+            ))
+        }
+    };
+    let viewer = match viewer_player_id(player_id) {
+        Ok(viewer) => viewer,
+        Err(error) => return JsValue::from_str(&error),
+    };
+    match with_state_mut(|state| to_js(&viewer_transition_snapshot(state, viewer, events))) {
         Ok(val) => val,
         Err(_) => JsValue::NULL,
     }

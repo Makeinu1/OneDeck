@@ -56,6 +56,12 @@ const mocks = vi.hoisted(() => ({
     actions: [],
     autoPassRecommended: false,
   })),
+  getViewerTransitionSnapshot: vi.fn(async (pid: number, events: unknown[]) => ({
+    state: { filteredFor: pid },
+    actions: [],
+    autoPassRecommended: false,
+    events,
+  })),
   projectSeatView: vi.fn(async (stateJson: string) => {
     const state = JSON.parse(stateJson) as {
       seats: Array<{ type: string }>;
@@ -84,6 +90,7 @@ vi.mock("../wasm-adapter", () => {
     getLegalActionsForViewer: mocks.getLegalActionsForViewer,
     getFilteredState: mocks.getFilteredState,
     getViewerSnapshot: mocks.getViewerSnapshot,
+    getViewerTransitionSnapshot: mocks.getViewerTransitionSnapshot,
     projectSeatView: mocks.projectSeatView,
     setMultiplayerMode: mocks.setMultiplayerMode,
     releaseHostSession: vi.fn(async (_claimed: boolean) => undefined),

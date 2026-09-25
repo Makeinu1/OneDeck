@@ -4635,6 +4635,15 @@ export interface ViewerSnapshot {
 }
 
 /**
+ * Viewer snapshot paired with the engine-owned projection of one transition.
+ * The event list is required here so P2P cannot accidentally fall back to the
+ * raw transition result when constructing a guest frame.
+ */
+export interface ViewerTransitionSnapshot extends ViewerSnapshot {
+  events: GameEvent[];
+}
+
+/**
  * Engine-authored display summary for the one explicit automation run that
  * follows loading a persisted game. The state in `RestoredGameStateResult` is
  * authoritative; this bounded tail only explains that one transition.

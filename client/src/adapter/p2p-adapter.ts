@@ -2311,7 +2311,7 @@ export class P2PHostAdapter implements EngineAdapter {
       for (const [pid, session] of this.guestSessions) {
         const token = this.playerTokens.get(pid)!;
         try {
-          const snapshot = await this.wasm.getViewerSnapshot(pid);
+          const snapshot = await this.wasm.getViewerTransitionSnapshot(pid, result.events);
           void this.send(session, {
             type: "game_setup",
             wireProtocolVersion: WIRE_PROTOCOL_VERSION,
@@ -2319,7 +2319,7 @@ export class P2PHostAdapter implements EngineAdapter {
             playerToken: token,
             revision,
             state: snapshot.state,
-            events: result.events,
+            events: snapshot.events,
             playerNames: allNames,
             ...legalActionsToWire(snapshot),
           }).then((accepted) => {
@@ -2657,12 +2657,12 @@ export class P2PHostAdapter implements EngineAdapter {
     for (const [pid, session] of this.guestSessions) {
       if (this.disconnectedSeats.has(pid)) continue;
       try {
-        const snapshot = await this.wasm.getViewerSnapshot(pid);
+        const snapshot = await this.wasm.getViewerTransitionSnapshot(pid, events);
         sends.push(this.send(session, {
           type: "state_update",
           revision,
           state: snapshot.state,
-          events,
+          events: snapshot.events,
           logEntries,
           ...legalActionsToWire(snapshot),
         }));
@@ -2910,7 +2910,8 @@ export class P2PHostAdapter implements EngineAdapter {
 
   /** The host owns the engine — delegate to the inner WASM adapter, which
    *  stamps the seq when the worker response arrives. (The broadcast path
-   *  `getViewerSnapshot` deliberately does NOT consume the counter: guests
+   *  `getViewerSnapshot`/`getViewerTransitionSnapshot` deliberately do NOT
+   *  consume the counter: guests
    *  stamp arrival order on their own ordered channel, and `seq` is never
    *  compared across clients.) */
   async getSnapshot(): Promise<EngineSnapshot> {
