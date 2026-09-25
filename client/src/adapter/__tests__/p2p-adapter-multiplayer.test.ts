@@ -2155,6 +2155,89 @@ describe("P2PHostAdapter — 3-4p multiplayer", () => {
     adapter.dispose();
   });
 
+  it("falls back to a state-only frame when a newer action overtakes delivery", async () => {
+    const firstEvent: GameEvent = {
+      type: "CardDrawn",
+      data: { player_id: 0, object_id: 101, nth_in_turn: 1, nth_in_step: 1 },
+    };
+    const secondEvent: GameEvent = {
+      type: "CardsDrawn",
+      data: { player_id: 0, count: 1 },
+    };
+    const firstAction: GameAction = { type: "PassPriority" };
+    const secondAction: GameAction = { type: "Concede", data: { player_id: 0 } };
+    const firstSnapshotStarted = deferred<void>();
+    const releaseFirstSnapshot = deferred<void>();
+    const firstLog = debugLogEntry("first transition");
+    const secondLog = debugLogEntry("second transition");
+
+    const { adapter, emitConnection } = makeHost(2);
+    await adapter.initialize();
+    const guest = await joinGuest(emitConnection, {
+      type: "guest_deck",
+      deckData: { player: { main_deck: [], sideboard: [] } },
+    });
+    await adapter.initializeGame();
+    guest.sent.length = 0;
+    mockSubmitAction.mockClear();
+    mockGetViewerSnapshot.mockClear();
+    mockGetViewerTransitionSnapshot.mockClear();
+    mockSubmitAction
+      .mockResolvedValueOnce({ events: [firstEvent], log_entries: [firstLog] })
+      .mockResolvedValueOnce({ events: [secondEvent], log_entries: [secondLog] });
+    mockGetViewerSnapshot.mockImplementation(async () => ({
+      state: remoteState("state-2"),
+      actions: [secondAction],
+      autoPassRecommended: false,
+    }));
+    mockGetViewerTransitionSnapshot
+      .mockImplementationOnce(async () => {
+        firstSnapshotStarted.resolve();
+        await releaseFirstSnapshot.promise;
+        return {
+          state: remoteState("state-2"),
+          actions: [secondAction],
+          autoPassRecommended: false,
+          events: [firstEvent],
+        };
+      })
+      .mockImplementationOnce(async () => ({
+        state: remoteState("state-2"),
+        actions: [secondAction],
+        autoPassRecommended: false,
+        events: [secondEvent],
+      }));
+
+    const first = adapter.submitAction(firstAction, 0);
+    await firstSnapshotStarted.promise;
+    const second = adapter.submitAction(secondAction, 0);
+    await flushPromises();
+    releaseFirstSnapshot.resolve();
+    await Promise.all([first, second]);
+
+    const updates = (await guest.getSentMessages()).filter(
+      (message): message is P2PMessage & { type: "state_update" } =>
+        typeof message === "object"
+        && message !== null
+        && (message as { type?: string }).type === "state_update",
+    );
+    expect(updates).toHaveLength(2);
+    expect(updates[0]).toMatchObject({
+      state: { label: "state-2" },
+      events: [],
+      legalActions: [secondAction],
+    });
+    expect(updates[0].logEntries).toBeUndefined();
+    expect(updates[1]).toMatchObject({
+      state: { label: "state-2" },
+      events: [secondEvent],
+      legalActions: [secondAction],
+      logEntries: [secondLog],
+    });
+    expect(mockGetViewerSnapshot).toHaveBeenCalledWith(1);
+    adapter.dispose();
+  });
+
   const isStateBearingWithRevision = (m: unknown): m is P2PMessage & { revision: number } =>
     typeof m === "object"
     && m !== null

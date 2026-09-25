@@ -16,6 +16,7 @@ import type {
   PersistedGameState,
   RestoredGameStateResult,
   SubmitResult,
+  ViewerSnapshot,
   WaitingFor,
 } from "./types";
 import type {
@@ -929,6 +930,14 @@ export class P2PHostAdapter implements EngineAdapter {
    * with the local phase-server's revision before fan-out. */
   private authoritativeRevision = 0;
   /**
+   * Monotonic browser-engine mutation generation. Delivery is intentionally
+   * queued after an action applies, so another action can advance the WASM
+   * state while an earlier viewer snapshot is waiting. A delivery captures
+   * this generation and downgrades to a state-only resync if it is no longer
+   * current, instead of pairing the old events/logs with the newer state.
+   */
+  private engineMutationRevision = 0;
+  /**
    * How far along each guest seat is, on two different signals — because the
    * two failure directions are not symmetric:
    *
@@ -1438,6 +1447,11 @@ export class P2PHostAdapter implements EngineAdapter {
     return result;
   }
 
+  private noteEngineMutation(): number {
+    this.engineMutationRevision += 1;
+    return this.engineMutationRevision;
+  }
+
   private rejectSuperseded(session: PeerSession): void {
     void session.send({ type: "reconnect_rejected", reason: "Host session superseded" });
     session.close("Host session superseded");
@@ -1665,8 +1679,9 @@ export class P2PHostAdapter implements EngineAdapter {
       }
       staleRetries = 0;
       const result = outcome.result;
+      const transitionRevision = this.noteEngineMutation();
       await this.publishHostSnapshot(result);
-      await this.broadcastStateUpdate(result.events, result.log_entries);
+      await this.broadcastStateUpdate(result.events, result.log_entries, undefined, transitionRevision);
       void this.persistAuthoritativeState();
     }
   }
@@ -2367,7 +2382,8 @@ export class P2PHostAdapter implements EngineAdapter {
       ? await this.nativeBridge.submitAction(action, actor)
       : await this.wasm.submitAction(action, actor);
     if (isZeroCountDebugCreate(action)) return result;
-    await this.broadcastStateUpdate(result.events, result.log_entries);
+    const transitionRevision = this.nativeBridge ? null : this.noteEngineMutation();
+    await this.broadcastStateUpdate(result.events, result.log_entries, undefined, transitionRevision);
     await this.runAiLoop();
     void this.persistAuthoritativeState();
     return result;
@@ -2391,7 +2407,8 @@ export class P2PHostAdapter implements EngineAdapter {
     const result = this.nativeBridge
       ? await this.nativeBridge.submitInteraction(submission, actor)
       : await this.wasm.submitInteraction(submission, actor);
-    await this.broadcastStateUpdate(result.events, result.log_entries);
+    const transitionRevision = this.nativeBridge ? null : this.noteEngineMutation();
+    await this.broadcastStateUpdate(result.events, result.log_entries, undefined, transitionRevision);
     await this.runAiLoop();
     void this.persistAuthoritativeState();
     return result;
@@ -2635,20 +2652,29 @@ export class P2PHostAdapter implements EngineAdapter {
    * its entry in `guestAckedRevisions`. A seat whose viewer read or send
    * fails — or which takes the bytes but never applies them — keeps its old
    * entry and is resynchronized by the redelivery sweep below. One seat's
-   * failure aborts neither the other seats nor the terminal close.
+   * failure aborts neither the other seats nor the terminal close. If a later
+   * browser-engine mutation overtakes a queued transition read, that delivery
+   * sends a state-only viewer snapshot and omits the older events/logs.
    */
   private async broadcastStateUpdate(
     events: GameEvent[],
     logEntries?: GameLogEntry[],
     terminalReason?: string,
+    transitionRevision: number | null = null,
   ): Promise<void> {
-    return this.enqueueDelivery(() => this.broadcastStateUpdateInner(events, logEntries, terminalReason));
+    return this.enqueueDelivery(() => this.broadcastStateUpdateInner(
+      events,
+      logEntries,
+      terminalReason,
+      transitionRevision,
+    ));
   }
 
   private async broadcastStateUpdateInner(
     events: GameEvent[],
     logEntries?: GameLogEntry[],
     terminalReason?: string,
+    transitionRevision: number | null = null,
   ): Promise<void> {
     if (!this.ownsAuthority()) return;
     if (this.nativeBridge) return;
@@ -2657,13 +2683,27 @@ export class P2PHostAdapter implements EngineAdapter {
     for (const [pid, session] of this.guestSessions) {
       if (this.disconnectedSeats.has(pid)) continue;
       try {
-        const snapshot = await this.wasm.getViewerTransitionSnapshot(pid, events);
+        let snapshot: ViewerSnapshot;
+        let projectedEvents: GameEvent[] = [];
+        let projectedLogEntries: GameLogEntry[] | undefined;
+        if (transitionRevision !== null && transitionRevision === this.engineMutationRevision) {
+          const transition = await this.wasm.getViewerTransitionSnapshot(pid, events);
+          if (transitionRevision === this.engineMutationRevision) {
+            snapshot = transition;
+            projectedEvents = transition.events;
+            projectedLogEntries = logEntries;
+          } else {
+            snapshot = await this.wasm.getViewerSnapshot(pid);
+          }
+        } else {
+          snapshot = await this.wasm.getViewerSnapshot(pid);
+        }
         sends.push(this.send(session, {
           type: "state_update",
           revision,
           state: snapshot.state,
-          events: snapshot.events,
-          logEntries,
+          events: projectedEvents,
+          ...(projectedLogEntries === undefined ? {} : { logEntries: projectedLogEntries }),
           ...legalActionsToWire(snapshot),
         }));
       } catch (err) {
@@ -2964,7 +3004,13 @@ export class P2PHostAdapter implements EngineAdapter {
     }
     const outcome = await this.wasm.submitAiActionProposal(proposal);
     if (outcome.status === "applied") {
-      await this.broadcastStateUpdate(outcome.result.events, outcome.result.log_entries);
+      const transitionRevision = this.noteEngineMutation();
+      await this.broadcastStateUpdate(
+        outcome.result.events,
+        outcome.result.log_entries,
+        undefined,
+        transitionRevision,
+      );
       await this.runAiLoop();
       void this.persistAuthoritativeState();
     }
@@ -3223,9 +3269,10 @@ export class P2PHostAdapter implements EngineAdapter {
             if (session) await this.send(session, { type: "action_noop" });
             break;
           }
+          const transitionRevision = this.nativeBridge ? null : this.noteEngineMutation();
           // Host screen first, then the guests (see `publishHostSnapshot`).
           await this.publishHostSnapshot(result);
-          await this.broadcastStateUpdate(result.events, result.log_entries);
+          await this.broadcastStateUpdate(result.events, result.log_entries, undefined, transitionRevision);
           // Wake the AI loop. After a guest's action lands, priority may have
           // shifted to an AI seat — without this, the AI never gets a turn
           // and the game stalls (same pattern as concedePlayer/host submit).
@@ -3262,8 +3309,9 @@ export class P2PHostAdapter implements EngineAdapter {
         }
         // Applied — same delivery contract as the "action" case above (#7924).
         try {
+          const transitionRevision = this.nativeBridge ? null : this.noteEngineMutation();
           await this.publishHostSnapshot(result);
-          await this.broadcastStateUpdate(result.events, result.log_entries);
+          await this.broadcastStateUpdate(result.events, result.log_entries, undefined, transitionRevision);
           await this.runAiLoop();
           void this.persistAuthoritativeState();
         } catch (err) {
@@ -3700,6 +3748,7 @@ export class P2PHostAdapter implements EngineAdapter {
       const result = this.nativeBridge
         ? await this.nativeBridge.submitAction(concedeAction, pid)
         : await this.wasm.submitAction(concedeAction, pid);
+      const transitionRevision = this.nativeBridge ? null : this.noteEngineMutation();
       // Both host emissions precede the fan-out: the concession has applied,
       // and a guest link failure must not hide it from the host's own screen
       // (#7924). Order between them is unchanged — state, then the notice.
@@ -3709,7 +3758,7 @@ export class P2PHostAdapter implements EngineAdapter {
           ? { type: "playerKicked", playerId: pid, reason }
           : { type: "playerConceded", playerId: pid, reason },
       );
-      await this.broadcastStateUpdate(result.events, result.log_entries, reason);
+      await this.broadcastStateUpdate(result.events, result.log_entries, reason, transitionRevision);
       await this.runAiLoop();
       void this.persistAuthoritativeState();
     } catch (err) {
