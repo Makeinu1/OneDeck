@@ -160,6 +160,7 @@ import { MANA_PAYMENT_WAITING_FOR_TYPES } from "../game/waitingForRegistry.ts";
 import { useGameDispatch } from "../hooks/useGameDispatch.ts";
 import { useInspectHoverProps } from "../hooks/useInspectHoverProps.ts";
 import { useKeyboardShortcuts } from "../hooks/useKeyboardShortcuts.ts";
+import { mulliganHandCardSizingStyle } from "../components/hand/handFanPresentation.ts";
 import { clearPromptOverlayState } from "../game/sessionCleanup.ts";
 import { clearGame, hasRemoteHumans, loadActiveGame, useGameStore } from "../stores/gameStore.ts";
 import { useUiStore } from "../stores/uiStore.ts";
@@ -2588,12 +2589,7 @@ function MulliganDecisionPrompt({
     >
       <div
         className="modal-card-area flex min-h-0 flex-1 items-center justify-center"
-        style={
-          {
-            "--card-w": "clamp(140px, 18vw, 257px)",
-            "--card-h": "clamp(196px, 25.2vw, 360px)",
-          } as React.CSSProperties
-        }
+        style={mulliganHandCardSizingStyle(handObjects.length)}
       >
         <div className="w-full overflow-x-auto">
           <div className="mx-auto flex w-max min-w-full items-center justify-center px-2 sm:px-4">
@@ -2620,7 +2616,6 @@ function MulliganDecisionPrompt({
                 <CardImage
                   cardName={obj.name}
                   size="normal"
-                  className="h-[clamp(200px,40vh,360px)] w-[clamp(143px,28.6vh,257px)]"
                 />
               </motion.div>
             ))}

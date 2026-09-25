@@ -15,6 +15,7 @@ import {
   HAND_FAN_RESTING_Y,
   handFanGeometry,
   handFanVerticalMetrics,
+  mulliganHandCardSizingStyle,
   playerHandFanSizingStyle,
 } from "../handFanPresentation.ts";
 
@@ -31,6 +32,19 @@ describe("player hand fan presentation", () => {
     expect(playerHandFanSizingStyle(20)).toMatchObject({
       "--hand-card-w": "min(calc(var(--card-w) * var(--hand-card-scale)), 16.73vw)",
       "--hand-card-h": "calc(var(--hand-card-w) * 1.4)",
+    });
+  });
+
+  it("fits a seven-card mulligan hand against the complete hand count", () => {
+    expect(mulliganHandCardSizingStyle(7)).toMatchObject({
+      "--card-w": "clamp(96px, calc((min(100vw, 72rem) - 6rem) / 7), 180px)",
+      "--card-h": "calc(var(--card-w) * 1.4)",
+    });
+  });
+
+  it("keeps mulligan sizing valid during an empty transient hand", () => {
+    expect(mulliganHandCardSizingStyle(0)).toMatchObject({
+      "--card-w": "clamp(96px, calc((min(100vw, 72rem) - 6rem) / 1), 180px)",
     });
   });
 
