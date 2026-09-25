@@ -418,16 +418,42 @@ pub(crate) fn project_for_viewer(
 pub(crate) fn abandon_for_owner_departure(
     state: &mut GameState,
     departing: crate::types::player::PlayerId,
-) {
+) -> Option<ResolutionPaymentTransaction> {
     if state
         .payment_transaction
         .as_ref()
         .is_some_and(|transaction| transaction.owner == departing)
     {
-        state.payment_transaction = None;
+        let transaction = state
+            .payment_transaction
+            .take()
+            .map(|transaction| *transaction);
         state.payment_transaction_replay = false;
         state.payment_transaction_just_handled = false;
+        state.cost_payment_failed_flag = true;
+        return transaction;
     }
+    None
+}
+
+/// Resume only a staged payment's printed continuation after its payer leaves.
+///
+/// The payer's departure makes the payment unsuccessful, but it does not remove
+/// an otherwise-surviving ability controller's unconditional sequential tail.
+/// The caller performs the CR 800.4a leave sweep first, then invokes this helper
+/// only when the root controller is still in the game.
+pub(crate) fn resolve_abandoned_continuation(
+    state: &mut GameState,
+    transaction: &ResolutionPaymentTransaction,
+    events: &mut Vec<GameEvent>,
+) -> Result<(), EngineError> {
+    resolve_root_continuation(
+        state,
+        &transaction.root,
+        false,
+        transaction.resolving_trigger_context.as_ref(),
+        events,
+    )
 }
 
 /// Whether the transaction path should own this action. Actor-scoped display,
@@ -479,6 +505,7 @@ mod tests {
         TargetFilter, TargetRef,
     };
     use crate::types::events::GameEvent;
+    use crate::types::game_state::PersistedGameState;
     use crate::types::identifiers::{CardId, ObjectId};
     use crate::types::mana::{ManaCost, ManaCostShard};
     use crate::types::player::PlayerId;
@@ -532,6 +559,88 @@ mod tests {
     }
 
     #[test]
+    fn transcript_legacy_actor_is_explicitly_compatible_but_new_actor_only_wire_rejects() {
+        let entry = ResolutionPaymentTranscriptEntry {
+            authenticated_actor: PlayerId(1),
+            semantic_owner: PlayerId(0),
+            action: GameAction::PassPriority,
+        };
+        let mut legacy = serde_json::to_value(&entry).expect("transcript serializes");
+        let object = legacy.as_object_mut().expect("transcript is an object");
+        let actor = object
+            .remove("authenticated_actor")
+            .expect("current actor field is present");
+        object.insert("actor".to_string(), actor);
+        object.remove("semantic_owner");
+        let restored: ResolutionPaymentTranscriptEntry =
+            serde_json::from_value(legacy).expect("legacy actor-only transcript restores");
+        assert_eq!(restored.authenticated_actor, PlayerId(1));
+        assert_eq!(restored.semantic_owner, PlayerId(1));
+
+        let mut current = serde_json::to_value(&entry).expect("transcript serializes");
+        current
+            .as_object_mut()
+            .expect("transcript is an object")
+            .remove("semantic_owner");
+        assert!(
+            serde_json::from_value::<ResolutionPaymentTranscriptEntry>(current).is_err(),
+            "a new authenticated_actor-only payload must not invent semantic owner P0"
+        );
+    }
+
+    #[test]
+    fn persisted_payment_transaction_rejects_out_of_range_owner_through_raw_and_trusted() {
+        let mut state = GameState::new_two_player(7);
+        state.payment_transaction = Some(Box::new(ResolutionPaymentTransaction {
+            wire_version: 1,
+            owner: PlayerId(0),
+            root: Box::new(ResolvedAbility::new(
+                Effect::GenericEffect {
+                    static_abilities: Vec::new(),
+                    duration: None,
+                    target: None,
+                    end_cost: None,
+                },
+                Vec::new(),
+                ObjectId(1),
+                PlayerId(0),
+            )),
+            transcript: vec![ResolutionPaymentTranscriptEntry {
+                authenticated_actor: PlayerId(0),
+                semantic_owner: PlayerId(0),
+                action: GameAction::PassPriority,
+            }],
+            base_waiting_for: crate::types::game_state::WaitingFor::Priority {
+                player: PlayerId(0),
+            },
+            resolving_trigger_context: None,
+        }));
+
+        for mut wire in [
+            serde_json::to_value(PersistedGameState::Raw(Box::new(state.clone())))
+                .expect("serialize raw"),
+            serde_json::to_value(PersistedGameState::capture(state.clone()))
+                .expect("serialize trusted"),
+        ] {
+            let transaction = if wire.get("payment_transaction").is_some() {
+                wire.get_mut("payment_transaction")
+                    .expect("payment transaction is persisted")
+            } else {
+                wire.get_mut("state")
+                    .and_then(|value| value.get_mut("payment_transaction"))
+                    .expect("trusted payment transaction is persisted")
+            };
+            transaction["owner"] = serde_json::json!(9);
+            let restored = serde_json::from_value::<PersistedGameState>(wire)
+                .expect("wire shape remains decodable");
+            let error = restored
+                .into_game_state()
+                .expect_err("restore must reject an out-of-range payment owner");
+            assert!(error.to_string().contains("payment transaction is invalid"));
+        }
+    }
+
+    #[test]
     fn unseated_wire_hides_hero_hand_in_one_vs_many_staged_payment() {
         let mut state = GameState::new(crate::types::format::FormatConfig::archenemy(), 4, 42);
         let hero_card = create_object(
@@ -540,6 +649,22 @@ mod tests {
             PlayerId(1),
             "R5 OneVsMany hero hand card".to_string(),
             Zone::Hand,
+        );
+        state.active_library_searches.insert(
+            crate::types::game_state::ActiveLibrarySearch::try_new(
+                PlayerId(0),
+                PlayerId(1),
+                Some(PlayerId(1)),
+                vec![PlayerId(0)],
+                vec![(
+                    PlayerId(1),
+                    Zone::Hand,
+                    crate::types::identifiers::ObjectIncarnationRef::from_object(
+                        &state.objects[&hero_card],
+                    ),
+                )],
+            )
+            .expect("search provenance fixture is coherent"),
         );
         state.waiting_for = crate::types::game_state::WaitingFor::Priority {
             player: PlayerId(0),
@@ -577,6 +702,10 @@ mod tests {
             "unseated wire leaked a hero hand identity: {wire}"
         );
         assert!(wire["state"].get("payment_transaction").is_none());
+        assert!(
+            wire["state"].get("active_library_searches").is_none(),
+            "unseated wire leaked a private search carrier: {wire}"
+        );
         assert!(matches!(
             serde_json::from_value::<crate::types::game_state::WaitingFor>(
                 wire["state"]["waiting_for"].clone()
@@ -1561,6 +1690,136 @@ mod tests {
             1,
             "the accepted controller choice replays once after departure"
         );
+    }
+
+    #[test]
+    fn payer_departure_preserves_surviving_controller_continuation() {
+        let mut state = GameState::new(crate::types::format::FormatConfig::standard(), 3, 42);
+        state.players[0].life = 20;
+        state.players[1].energy = 0;
+        let payer_card = create_object(
+            &mut state,
+            CardId(925),
+            PlayerId(1),
+            "R5 payer departure card".to_string(),
+            Zone::Hand,
+        );
+        create_object(
+            &mut state,
+            CardId(926),
+            PlayerId(1),
+            "R5 payer departure alternate".to_string(),
+            Zone::Hand,
+        );
+        let source = create_object(
+            &mut state,
+            CardId(927),
+            PlayerId(0),
+            "R5 payer departure source".to_string(),
+            Zone::Battlefield,
+        );
+        let mut root = ResolvedAbility::new(
+            Effect::PayCost {
+                cost: AbilityCost::Composite {
+                    costs: vec![
+                        AbilityCost::Discard {
+                            count: QuantityExpr::Fixed { value: 1 },
+                            filter: None,
+                            selection: crate::types::ability::CardSelectionMode::Chosen,
+                            self_scope: crate::types::ability::DiscardSelfScope::FromHand,
+                        },
+                        AbilityCost::PayEnergy {
+                            amount: QuantityExpr::Fixed { value: 1 },
+                        },
+                    ],
+                },
+                scale: None,
+                payer: TargetFilter::Player,
+            },
+            vec![TargetRef::Player(PlayerId(1))],
+            source,
+            PlayerId(0),
+        );
+        let mut gated = ResolvedAbility::new(
+            Effect::GainLife {
+                amount: QuantityExpr::Fixed { value: 2 },
+                player: TargetFilter::Controller,
+            },
+            Vec::new(),
+            source,
+            PlayerId(0),
+        );
+        gated.condition = Some(AbilityCondition::EffectOutcome {
+            signal: EffectOutcomeSignal::OptionalEffectPerformed,
+        });
+        let mut unconditional = ResolvedAbility::new(
+            Effect::GainLife {
+                amount: QuantityExpr::Fixed { value: 3 },
+                player: TargetFilter::Controller,
+            },
+            Vec::new(),
+            source,
+            PlayerId(0),
+        );
+        unconditional.sub_link = SubAbilityLink::SequentialSibling;
+        gated.sub_ability = Some(Box::new(unconditional));
+        root.sub_ability = Some(Box::new(gated));
+
+        let mut setup_events = Vec::new();
+        effects::resolve_ability_chain(&mut state, &root, &mut setup_events, 0)
+            .expect("payer departure witness reaches a staged discard prompt");
+        assert!(matches!(
+            state.waiting_for,
+            crate::types::game_state::WaitingFor::DiscardChoice {
+                player: PlayerId(1),
+                ..
+            }
+        ));
+        assert_eq!(
+            state
+                .payment_transaction
+                .as_ref()
+                .expect("payer departure witness must stage before Concede")
+                .owner,
+            PlayerId(1)
+        );
+
+        let result = crate::game::engine::apply_as_current(
+            &mut state,
+            GameAction::Concede {
+                player_id: PlayerId(1),
+            },
+        )
+        .expect("payer may concede during the staged payment prompt");
+
+        assert!(state.payment_transaction.is_none());
+        assert!(state.players[1].is_eliminated);
+        assert!(!state.players[0].is_eliminated);
+        assert_eq!(
+            state.players[0].life, 23,
+            "the surviving root controller keeps the unconditional continuation"
+        );
+        assert_eq!(state.objects[&payer_card].zone, Zone::Exile);
+        assert!(!result.events.iter().any(|event| matches!(
+            event,
+            GameEvent::LifeChanged {
+                player_id: PlayerId(0),
+                amount: 2,
+                ..
+            }
+        )));
+        assert!(!result.events.iter().any(|event| matches!(
+            event,
+            GameEvent::Discarded { object_id, .. } if *object_id == payer_card
+        )));
+        assert!(result.events.iter().any(|event| matches!(
+            event,
+            GameEvent::ZoneChanged {
+                object_id,
+                to: Zone::Exile,
+                ..
+            } if *object_id == payer_card
+        )));
     }
 
     #[test]

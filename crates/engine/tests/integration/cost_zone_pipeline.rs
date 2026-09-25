@@ -8812,12 +8812,16 @@ fn nested_composite_effect_cost_serializes_all_suffixes_and_rider_once() {
     let mut initial_events = Vec::new();
     resolve_ability_chain(runner.state_mut(), &ability, &mut initial_events, 0)
         .expect("the nested cost reaches the source's replacement pause");
+    assert!(runner.state().payment_transaction.is_some());
+    assert!(runner.state().pending_cost_move_resume.is_none());
     assert!(matches!(
         runner.state().waiting_for,
         WaitingFor::ReplacementChoice { .. }
     ));
     assert!(matches!(
-        runner.state().pending_cost_move_resume.as_ref(),
+        engine::game::staged_payment_shadow_for_test(runner.state())
+            .pending_cost_move_resume
+            .as_ref(),
         Some(PendingCostMoveResume::ManaAbilityPayment { pending, .. }) if matches!(
             &pending.resume,
             ManaAbilityResume::EffectPayCost { cost: paused_cost, .. }

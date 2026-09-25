@@ -1051,6 +1051,13 @@ fn client_state_wire_value(
         return Ok(value);
     };
 
+    // This JSON-only marker records provenance for persistence ingress. It is
+    // intentionally not a `GameState` field: client projections remain
+    // transportable, but a projection must never be accepted as a trusted
+    // restore authority. A positive marker avoids inferring provenance from
+    // mutable redaction lists or from private execution carriers.
+    root.insert("wire_projection".to_string(), serde_json::Value::Bool(true));
+
     if let Some(display_visible_object_ids) = display_visible_object_ids {
         if let Some(objects) = root
             .get_mut("objects")

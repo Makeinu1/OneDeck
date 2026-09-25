@@ -1098,26 +1098,12 @@ pub fn filter_state_for_viewer(state: &GameState, viewer: PlayerId) -> GameState
 /// unseated observer has no private-zone or team access, including in
 /// OneVsMany/Archenemy topologies.
 pub fn filter_state_for_unseated_viewer(state: &GameState) -> GameState {
-    // Keep the unscoped wire's public continuation/provenance shape intact.
-    // `filter_state_for_scope` is the seated viewer projection authority and
-    // deliberately clears executable carriers such as `resolution_stack` and
-    // delayed-trigger roots; a direct client wire must retain those public
-    // fields so its existing raw-ingress fingerprint remains meaningful.
-    let mut filtered = crate::game::payment_transaction::project_without_viewer(state);
-    for (object_id, projection) in identity_projection_for_unseated_viewer(state) {
-        match projection {
-            IdentityProjection::Hidden => hide_card(&mut filtered, object_id),
-            IdentityProjection::FaceDownRedacted => {
-                if let Some(object) = filtered.objects.get_mut(&object_id) {
-                    redact_face_down_identity_from_observer(object);
-                }
-            }
-            // The unseated scope never receives a revealed face-down identity.
-            IdentityProjection::FaceDownRevealed => {}
-        }
-    }
-    filtered.viewer_projection = None;
-    filtered
+    // An unseated wire is still a viewer projection: it has no private-zone or
+    // team access, and it must not retain rules-execution authority merely to
+    // preserve a historical wire shape. The shared scope owns every cleanup
+    // and redaction seam; `None` is the fail-closed audience, not a sentinel
+    // player that could accidentally gain topology or turn-control access.
+    filter_state_for_scope(state, None)
 }
 
 fn filter_state_for_scope(state: &GameState, viewer: Option<PlayerId>) -> GameState {
