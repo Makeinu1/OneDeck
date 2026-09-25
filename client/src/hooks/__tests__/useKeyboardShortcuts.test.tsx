@@ -8,11 +8,18 @@ import { useUiStore } from "../../stores/uiStore";
 import {
   buildGameState,
   buildManaPaymentWaitingFor,
+  buildPriorityWaitingFor,
   buildTargetSelectionProgress,
   buildTargetSelectionSlot,
   buildTriggerTargetSelectionWaitingFor,
 } from "../../test/factories/gameStateFactory";
 import type { GameAction, GameEvent } from "../../adapter/types";
+
+const dispatchActionMock = vi.hoisted(() => vi.fn());
+
+vi.mock("../../game/dispatch", () => ({
+  dispatchAction: dispatchActionMock,
+}));
 
 function KeyboardHarness() {
   useKeyboardShortcuts();
@@ -21,6 +28,8 @@ function KeyboardHarness() {
 
 describe("useKeyboardShortcuts", () => {
   beforeEach(() => {
+    dispatchActionMock.mockReset();
+    dispatchActionMock.mockResolvedValue(undefined);
     act(() => {
       useUiStore.setState({ selectedCardIds: [10, 20] });
     });
@@ -28,6 +37,61 @@ describe("useKeyboardShortcuts", () => {
 
   afterEach(() => {
     cleanup();
+  });
+
+  it("space passes priority through the canonical dispatch pipeline", () => {
+    const directDispatch = vi.fn().mockResolvedValue([]);
+    const gameState = buildGameState({
+      waiting_for: buildPriorityWaitingFor({ data: { player: 0 } }),
+    });
+
+    act(() => {
+      useGameStore.setState({
+        gameState,
+        waitingFor: gameState.waiting_for,
+        dispatch: directDispatch,
+        undo: vi.fn(),
+        stateHistory: [],
+      });
+    });
+
+    render(<KeyboardHarness />);
+
+    act(() => {
+      window.dispatchEvent(new KeyboardEvent("keydown", { key: " " }));
+    });
+
+    expect(dispatchActionMock).toHaveBeenCalledTimes(1);
+    expect(dispatchActionMock).toHaveBeenCalledWith({ type: "PassPriority" });
+    expect(directDispatch).not.toHaveBeenCalled();
+  });
+
+  it("space does not submit when another seat owns the priority decision", () => {
+    const directDispatch = vi.fn().mockResolvedValue([]);
+    const gameState = buildGameState({
+      waiting_for: buildPriorityWaitingFor({ data: { player: 1 } }),
+      priority_player: 1,
+    });
+
+    act(() => {
+      useGameStore.setState({
+        gameMode: "ai",
+        gameState,
+        waitingFor: gameState.waiting_for,
+        dispatch: directDispatch,
+        undo: vi.fn(),
+        stateHistory: [],
+      });
+    });
+
+    render(<KeyboardHarness />);
+
+    act(() => {
+      window.dispatchEvent(new KeyboardEvent("keydown", { key: " " }));
+    });
+
+    expect(dispatchActionMock).not.toHaveBeenCalled();
+    expect(directDispatch).not.toHaveBeenCalled();
   });
 
   it("escape skips an optional trigger target through the engine action", () => {
